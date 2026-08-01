@@ -1,0 +1,6 @@
+[submodule "vendor/FTXUI"]
+	path = vendor/FTXUI
+	url = https://github.com/ArthurSonzogni/FTXUI
+[submodule "vendor/uWebSockets"]
+	path = vendor/uWebSockets
+	url = https://github.com/uNetworking/uWebSockets
