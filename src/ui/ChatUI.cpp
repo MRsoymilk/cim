@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <chrono>
 
 namespace cim {
 
@@ -93,6 +94,15 @@ inline std::vector<std::string> fetchOnlineUsers(const std::string& host = "127.
 
 ChatUI::ChatUI() {
     sendHttpPost("/join", my_name_);
+
+    heartbeat_thread_ = std::jthread([this](std::stop_token st) {
+        while (!st.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            if (!st.stop_requested()) {
+                sendHttpPost("/heartbeat", my_name_);
+            }
+        }
+    });
 
     auto online_names = fetchOnlineUsers();
     for (const auto& uname : online_names) {
@@ -197,6 +207,10 @@ ChatUI::ChatUI() {
         left_container_,
         right_container_,
     }, &active_pane_);
+}
+
+ChatUI::~ChatUI() {
+    sendHttpPost("/leave", my_name_);
 }
 
 void ChatUI::UpdateFilteredContacts() {

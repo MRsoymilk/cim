@@ -3,6 +3,7 @@
 #include "ftxui/component/component.hpp"
 #include <string>
 #include <vector>
+#include <thread>
 
 namespace cim {
 
@@ -15,6 +16,7 @@ struct Contact {
 class ChatUI {
 public:
     ChatUI();
+    ~ChatUI();
     ftxui::Component GetComponent();
 
 private:
@@ -43,6 +45,8 @@ private:
 
     std::vector<int> filtered_indices_;
     std::vector<std::string> filtered_names_;
+
+    std::jthread heartbeat_thread_;
 
     void UpdateFilteredContacts();
     void SendMessage();
