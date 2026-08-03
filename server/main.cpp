@@ -1,25 +1,15 @@
 #include "App.h"
+#include <nlohmann/json.hpp>
 #include <iostream>
 #include <string>
 #include <unordered_map>
 #include <string_view>
 
+using json = nlohmann::json;
+
 struct PerSocketData {
     std::string username;
 };
-
-std::string extractJsonField(std::string_view json, const std::string& key) {
-    std::string search_key = "\"" + key + "\"";
-    size_t pos = json.find(search_key);
-    if (pos == std::string_view::npos) return "";
-    pos = json.find(':', pos);
-    if (pos == std::string_view::npos) return "";
-    pos = json.find('"', pos);
-    if (pos == std::string_view::npos) return "";
-    size_t end_pos = json.find('"', pos + 1);
-    if (end_pos == std::string_view::npos) return "";
-    return std::string(json.substr(pos + 1, end_pos - pos - 1));
-}
 
 int main() {
     std::unordered_map<std::string, uWS::WebSocket<false, true, PerSocketData>*> clients;
@@ -39,31 +29,44 @@ int main() {
 
         .message = [&clients](auto* ws, std::string_view message, uWS::OpCode opCode) {
             auto* userData = ws->getUserData();
-            std::string type = extractJsonField(message, "type");
+            try {
+                auto j = json::parse(message);
+                std::string type = j.value("type", "");
 
-            if (type == "register") {
-                std::string username = extractJsonField(message, "username");
-                if (!username.empty()) {
-                    userData->username = username;
-                    clients[username] = ws;
-                    std::cout << "[Server] Registered user: " << username << std::endl;
-                    ws->send("{\"type\":\"system\",\"message\":\"Registered successfully\"}", opCode, false);
+                if (type == "register") {
+                    std::string username = j.value("username", "");
+                    if (!username.empty()) {
+                        userData->username = username;
+                        clients[username] = ws;
+                        std::cout << "[Server] Registered user: " << username << std::endl;
+                        json res;
+                        res["type"] = "system";
+                        res["message"] = "Registered successfully";
+                        ws->send(res.dump(), opCode, false);
+                    }
+                } else if (type == "chat") {
+                    std::string to = j.value("to", "");
+                    std::string content = j.value("content", "");
+                    std::string from = userData->username;
+
+                    std::cout << "[Server] Chat from " << from << " to " << to << ": " << content << std::endl;
+
+                    auto it = clients.find(to);
+                    if (it != clients.end()) {
+                        json outgoing;
+                        outgoing["type"] = "chat";
+                        outgoing["from"] = from;
+                        outgoing["content"] = content;
+                        it->second->send(outgoing.dump(), opCode, false);
+                    } else {
+                        json err;
+                        err["type"] = "system";
+                        err["message"] = "User " + to + " is offline.";
+                        ws->send(err.dump(), opCode, false);
+                    }
                 }
-            } else if (type == "chat") {
-                std::string to = extractJsonField(message, "to");
-                std::string content = extractJsonField(message, "content");
-                std::string from = userData->username;
-
-                std::cout << "[Server] Chat from " << from << " to " << to << ": " << content << std::endl;
-
-                auto it = clients.find(to);
-                if (it != clients.end()) {
-                    std::string outgoing = "{\"type\":\"chat\",\"from\":\"" + from + "\",\"content\":\"" + content + "\"}";
-                    it->second->send(outgoing, opCode, false);
-                } else {
-                    std::string err = "{\"type\":\"system\",\"message\":\"User " + to + " is offline.\"}";
-                    ws->send(err, opCode, false);
-                }
+            } catch (const std::exception& e) {
+                std::cerr << "[Server] JSON parse error: " << e.what() << std::endl;
             }
         },
 

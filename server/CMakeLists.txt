@@ -19,6 +19,7 @@ add_executable(cim-server main.cpp)
 target_include_directories(cim-server PRIVATE 
     ${CMAKE_SOURCE_DIR}/vendor/uWebSockets/src
     ${CMAKE_SOURCE_DIR}/vendor/uWebSockets/uSockets/src
+    ${CMAKE_SOURCE_DIR}/vendor/nlohmann_json/single_include
 )
 target_link_libraries(cim-server PRIVATE usockets pthread z)
 target_compile_features(cim-server PRIVATE cxx_std_20)
