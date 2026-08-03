@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 
+set(FTXUI_QUIET ON CACHE BOOL "" FORCE)
 add_subdirectory(vendor/FTXUI)
 
 add_executable(cim 
