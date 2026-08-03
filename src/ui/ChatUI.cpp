@@ -2,24 +2,110 @@
 #include "ftxui/dom/elements.hpp"
 #include "ftxui/component/event.hpp"
 #include "ftxui/component/component.hpp"
+#include <nlohmann/json.hpp>
 #include <algorithm>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 namespace cim {
 
+inline void sendHttpPost(const std::string& endpoint, const std::string& username, const std::string& host = "127.0.0.1", int port = 9001) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return;
+
+    sockaddr_in serv_addr{};
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(port);
+    inet_pton(AF_INET, host.c_str(), &serv_addr.sin_addr);
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(sock);
+        return;
+    }
+
+    nlohmann::json j;
+    j["username"] = username;
+    std::string body = j.dump();
+
+    std::string req = "POST " + endpoint + " HTTP/1.1\r\n"
+                      "Host: " + host + "\r\n"
+                      "Content-Type: application/json\r\n"
+                      "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                      "Connection: close\r\n\r\n" + body;
+
+    send(sock, req.c_str(), req.size(), 0);
+    close(sock);
+}
+
+inline std::vector<std::string> fetchOnlineUsers(const std::string& host = "127.0.0.1", int port = 9001) {
+    std::vector<std::string> users;
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return users;
+
+    sockaddr_in serv_addr{};
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(port);
+    inet_pton(AF_INET, host.c_str(), &serv_addr.sin_addr);
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(sock);
+        return users;
+    }
+
+    std::string req = "GET /users HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
+    send(sock, req.c_str(), req.size(), 0);
+
+    std::string response;
+    char buffer[4096];
+    int bytes_received = 0;
+    while ((bytes_received = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
+        buffer[bytes_received] = '\0';
+        response += buffer;
+    }
+    close(sock);
+
+    size_t body_pos = response.find("\r\n\r\n");
+    if (body_pos != std::string::npos) {
+        std::string body = response.substr(body_pos + 4);
+        try {
+            auto j = nlohmann::json::parse(body);
+            if (j.is_array()) {
+                for (const auto& item : j) {
+                    users.push_back(item.get<std::string>());
+                }
+            }
+        } catch (...) {}
+    }
+
+    return users;
+}
+
 ChatUI::ChatUI() {
-    contacts_ = {
-        {"1", "Bob", {
-            {false, "Hey there!"},
-            {true, "Hi Bob, how are you?"}
-        }},
-        {"2", "Charlie", {
-            {false, "Did you check the code?"}
-        }},
-        {"3", "Dev Team", {
-            {false, "Meeting at 3 PM today."}
-        }},
-        {"4", "David", {}}
-    };
+    sendHttpPost("/join", my_name_);
+
+    auto online_names = fetchOnlineUsers();
+    for (const auto& uname : online_names) {
+        if (uname != my_name_) {
+            contacts_.push_back({uname, uname, {}});
+        }
+    }
+    if (contacts_.empty()) {
+        contacts_ = {
+            {"1", "Bob", {}},
+            {"2", "Charlie", {}}
+        };
+    }
 
     UpdateFilteredContacts();
 
@@ -27,8 +113,13 @@ ChatUI::ChatUI() {
     name_option.multiline = false;
     name_option.on_enter = [this] {
         name_input_text_.erase(std::remove(name_input_text_.begin(), name_input_text_.end(), '\n'), name_input_text_.end());
-        if (!name_input_text_.empty()) {
+        if (!name_input_text_.empty() && name_input_text_ != my_name_) {
+            sendHttpPost("/leave", my_name_);
             my_name_ = name_input_text_;
+            sendHttpPost("/join", my_name_);
+            editing_name_ = false;
+            name_button_->TakeFocus();
+        } else {
             editing_name_ = false;
             name_button_->TakeFocus();
         }
@@ -38,6 +129,13 @@ ChatUI::ChatUI() {
     ftxui::InputOption search_option;
     search_option.multiline = false;
     search_option.on_change = [this] {
+        auto online_names = fetchOnlineUsers();
+        contacts_.clear();
+        for (const auto& uname : online_names) {
+            if (uname != my_name_) {
+                contacts_.push_back({uname, uname, {}});
+            }
+        }
         UpdateFilteredContacts();
         selected_contact_index_ = 0;
     };
@@ -88,7 +186,6 @@ ChatUI::ChatUI() {
     left_container_ = ftxui::Container::Vertical({
         name_button_,
         search_input_,
-        my_name_input_,
         contact_menu_,
     });
 
@@ -132,6 +229,16 @@ ftxui::Component ChatUI::GetComponent() {
     return ftxui::Renderer(split_container_, [this] {
         using namespace ftxui;
 
+        auto online_names = fetchOnlineUsers();
+        for (const auto& uname : online_names) {
+            if (uname != my_name_) {
+                auto it = std::find_if(contacts_.begin(), contacts_.end(), [&](const Contact& c) { return c.name == uname; });
+                if (it == contacts_.end()) {
+                    contacts_.push_back({uname, uname, {}});
+                }
+            }
+        }
+
         UpdateFilteredContacts();
         if (selected_contact_index_ >= (int)filtered_names_.size()) {
             selected_contact_index_ = filtered_names_.empty() ? -1 : (int)filtered_names_.size() - 1;
@@ -142,7 +249,7 @@ ftxui::Component ChatUI::GetComponent() {
         auto left_pane = vbox(Elements{
             hbox(Elements{
                 text(" USER: ") | bold | color(Color::Cyan),
-                name_display,
+                editing_name_ ? my_name_input_->Render() : name_button_->Render(),
             }),
             separator(),
             hbox(Elements{
@@ -224,7 +331,6 @@ ftxui::Component ChatUI::GetComponent() {
             return true;
         }
 
-        // If at the top contact and pressing Up, jump directly to search input
         if (active_pane_ == 0 && contact_menu_->Focused() && selected_contact_index_ == 0 && event == ftxui::Event::ArrowUp) {
             search_input_->TakeFocus();
             return true;
