@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(cim VERSION 0.0.5 LANGUAGES C CXX)
+project(cim VERSION 0.0.6 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,5 +16,8 @@ add_executable(cim
 
 target_include_directories(cim PRIVATE src vendor/nlohmann_json/single_include)
 target_link_libraries(cim PRIVATE ftxui::component)
+if(WIN32)
+    target_link_libraries(cim PRIVATE ws2_32)
+endif()
 
 add_subdirectory(server)

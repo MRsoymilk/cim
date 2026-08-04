@@ -4,15 +4,55 @@
 #include "ftxui/component/component.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <chrono>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <chrono>
+#include <netdb.h>
+#endif
 
 namespace cim {
 
+class WinSockInitializer {
+public:
+    WinSockInitializer() {
+#ifdef _WIN32
+        WSADATA wsaData;
+        WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
+    }
+    ~WinSockInitializer() {
+#ifdef _WIN32
+        WSACleanup();
+#endif
+    }
+};
+
+inline void closeSocket(int sock) {
+#ifdef _WIN32
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+}
+
+inline int createSocket() {
+#ifdef _WIN32
+    return static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
+#else
+    return socket(AF_INET, SOCK_STREAM, 0);
+#endif
+}
+
 inline bool sendAuthRequest(bool is_register, const std::string& username, const std::string& password, std::string& token_out, int64_t& id_out, std::string& error_out, const std::string& host = "127.0.0.1", int port = 9001) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    static WinSockInitializer ws_init;
+    int sock = createSocket();
     if (sock < 0) {
         error_out = "Socket creation failed";
         return false;
@@ -23,13 +63,18 @@ inline bool sendAuthRequest(bool is_register, const std::string& username, const
     serv_addr.sin_port = htons(port);
     inet_pton(AF_INET, host.c_str(), &serv_addr.sin_addr);
 
+#ifdef _WIN32
+    DWORD tv = 2000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
     struct timeval tv;
     tv.tv_sec = 2;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#endif
 
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(sock);
+        closeSocket(sock);
         error_out = "Connection to server failed";
         return false;
     }
@@ -46,7 +91,7 @@ inline bool sendAuthRequest(bool is_register, const std::string& username, const
                       "Content-Length: " + std::to_string(body.size()) + "\r\n"
                       "Connection: close\r\n\r\n" + body;
 
-    send(sock, req.c_str(), req.size(), 0);
+    send(sock, req.c_str(), (int)req.size(), 0);
 
     std::string response;
     char buffer[4096];
@@ -55,7 +100,7 @@ inline bool sendAuthRequest(bool is_register, const std::string& username, const
         buffer[bytes_received] = '\0';
         response += buffer;
     }
-    close(sock);
+    closeSocket(sock);
 
     size_t body_pos = response.find("\r\n\r\n");
     if (body_pos != std::string::npos) {
@@ -79,7 +124,8 @@ inline bool sendAuthRequest(bool is_register, const std::string& username, const
 }
 
 inline void sendAuthenticatedPost(const std::string& endpoint, const std::string& token, const std::string& host = "127.0.0.1", int port = 9001) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    static WinSockInitializer ws_init;
+    int sock = createSocket();
     if (sock < 0) return;
 
     sockaddr_in serv_addr{};
@@ -87,13 +133,18 @@ inline void sendAuthenticatedPost(const std::string& endpoint, const std::string
     serv_addr.sin_port = htons(port);
     inet_pton(AF_INET, host.c_str(), &serv_addr.sin_addr);
 
+#ifdef _WIN32
+    DWORD tv = 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
     struct timeval tv;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#endif
 
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(sock);
+        closeSocket(sock);
         return;
     }
 
@@ -103,13 +154,14 @@ inline void sendAuthenticatedPost(const std::string& endpoint, const std::string
                       "Content-Length: 0\r\n"
                       "Connection: close\r\n\r\n";
 
-    send(sock, req.c_str(), req.size(), 0);
-    close(sock);
+    send(sock, req.c_str(), (int)req.size(), 0);
+    closeSocket(sock);
 }
 
 inline std::vector<Contact> fetchOnlineUsersWithAuth(const std::string& token, const std::string& current_username, const std::string& host = "127.0.0.1", int port = 9001) {
+    static WinSockInitializer ws_init;
     std::vector<Contact> contacts;
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    int sock = createSocket();
     if (sock < 0) return contacts;
 
     sockaddr_in serv_addr{};
@@ -117,13 +169,18 @@ inline std::vector<Contact> fetchOnlineUsersWithAuth(const std::string& token, c
     serv_addr.sin_port = htons(port);
     inet_pton(AF_INET, host.c_str(), &serv_addr.sin_addr);
 
+#ifdef _WIN32
+    DWORD tv = 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#else
     struct timeval tv;
     tv.tv_sec = 1;
     tv.tv_usec = 0;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+#endif
 
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        close(sock);
+        closeSocket(sock);
         return contacts;
     }
 
@@ -132,7 +189,7 @@ inline std::vector<Contact> fetchOnlineUsersWithAuth(const std::string& token, c
                       "Authorization: Bearer " + token + "\r\n"
                       "Connection: close\r\n\r\n";
 
-    send(sock, req.c_str(), req.size(), 0);
+    send(sock, req.c_str(), (int)req.size(), 0);
 
     std::string response;
     char buffer[4096];
@@ -141,7 +198,7 @@ inline std::vector<Contact> fetchOnlineUsersWithAuth(const std::string& token, c
         buffer[bytes_received] = '\0';
         response += buffer;
     }
-    close(sock);
+    closeSocket(sock);
 
     size_t body_pos = response.find("\r\n\r\n");
     if (body_pos != std::string::npos) {
@@ -458,7 +515,7 @@ ftxui::Component ChatUI::GetComponent() {
         });
     }) | ftxui::CatchEvent([this](ftxui::Event event) {
         if (auth_state_ != AuthState::LoggedIn) return false;
-        if (editing_name_) {
+        if (editing_name_ ) {
             return false;
         }
 
