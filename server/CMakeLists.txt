@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
+find_package(SQLite3 REQUIRED)
+
 add_library(usockets STATIC
     ${CMAKE_SOURCE_DIR}/vendor/uWebSockets/uSockets/src/bsd.c
     ${CMAKE_SOURCE_DIR}/vendor/uWebSockets/uSockets/src/context.c
@@ -15,11 +17,11 @@ target_include_directories(usockets PUBLIC
     ${CMAKE_SOURCE_DIR}/vendor/uWebSockets/uSockets/src
 )
 
-add_executable(cim-server main.cpp)
+add_executable(cim-server main.cpp Database.cpp)
 target_include_directories(cim-server PRIVATE 
     ${CMAKE_SOURCE_DIR}/vendor/uWebSockets/src
     ${CMAKE_SOURCE_DIR}/vendor/uWebSockets/uSockets/src
     ${CMAKE_SOURCE_DIR}/vendor/nlohmann_json/single_include
 )
-target_link_libraries(cim-server PRIVATE usockets pthread z)
+target_link_libraries(cim-server PRIVATE usockets SQLite3::SQLite3 sodium pthread z dl)
 target_compile_features(cim-server PRIVATE cxx_std_20)

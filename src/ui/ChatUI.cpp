@@ -11,7 +11,74 @@
 
 namespace cim {
 
-inline void sendHttpPost(const std::string& endpoint, const std::string& username, const std::string& host = "127.0.0.1", int port = 9001) {
+inline bool sendAuthRequest(bool is_register, const std::string& username, const std::string& password, std::string& token_out, int64_t& id_out, std::string& error_out, const std::string& host = "127.0.0.1", int port = 9001) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        error_out = "Socket creation failed";
+        return false;
+    }
+
+    sockaddr_in serv_addr{};
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(port);
+    inet_pton(AF_INET, host.c_str(), &serv_addr.sin_addr);
+
+    struct timeval tv;
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+        close(sock);
+        error_out = "Connection to server failed";
+        return false;
+    }
+
+    nlohmann::json j;
+    j["username"] = username;
+    j["password"] = password;
+    std::string body = j.dump();
+
+    std::string endpoint = is_register ? "/auth/register" : "/auth/login";
+    std::string req = "POST " + endpoint + " HTTP/1.1\r\n"
+                      "Host: " + host + "\r\n"
+                      "Content-Type: application/json\r\n"
+                      "Content-Length: " + std::to_string(body.size()) + "\r\n"
+                      "Connection: close\r\n\r\n" + body;
+
+    send(sock, req.c_str(), req.size(), 0);
+
+    std::string response;
+    char buffer[4096];
+    int bytes_received = 0;
+    while ((bytes_received = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
+        buffer[bytes_received] = '\0';
+        response += buffer;
+    }
+    close(sock);
+
+    size_t body_pos = response.find("\r\n\r\n");
+    if (body_pos != std::string::npos) {
+        std::string resp_body = response.substr(body_pos + 4);
+        try {
+            auto res_json = nlohmann::json::parse(resp_body);
+            if (res_json.contains("success") && res_json["success"].get<bool>()) {
+                token_out = res_json.value("token", "");
+                id_out = res_json.value("user_id", -1);
+                return true;
+            } else {
+                error_out = res_json.value("error", "Authentication failed");
+            }
+        } catch (...) {
+            error_out = "Invalid response from server";
+        }
+    } else {
+        error_out = "No response from server";
+    }
+    return false;
+}
+
+inline void sendAuthenticatedPost(const std::string& endpoint, const std::string& token, const std::string& host = "127.0.0.1", int port = 9001) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) return;
 
@@ -30,24 +97,20 @@ inline void sendHttpPost(const std::string& endpoint, const std::string& usernam
         return;
     }
 
-    nlohmann::json j;
-    j["username"] = username;
-    std::string body = j.dump();
-
     std::string req = "POST " + endpoint + " HTTP/1.1\r\n"
                       "Host: " + host + "\r\n"
-                      "Content-Type: application/json\r\n"
-                      "Content-Length: " + std::to_string(body.size()) + "\r\n"
-                      "Connection: close\r\n\r\n" + body;
+                      "Authorization: Bearer " + token + "\r\n"
+                      "Content-Length: 0\r\n"
+                      "Connection: close\r\n\r\n";
 
     send(sock, req.c_str(), req.size(), 0);
     close(sock);
 }
 
-inline std::vector<std::string> fetchOnlineUsers(const std::string& host = "127.0.0.1", int port = 9001) {
-    std::vector<std::string> users;
+inline std::vector<Contact> fetchOnlineUsersWithAuth(const std::string& token, const std::string& current_username, const std::string& host = "127.0.0.1", int port = 9001) {
+    std::vector<Contact> contacts;
     int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return users;
+    if (sock < 0) return contacts;
 
     sockaddr_in serv_addr{};
     serv_addr.sin_family = AF_INET;
@@ -61,10 +124,14 @@ inline std::vector<std::string> fetchOnlineUsers(const std::string& host = "127.
 
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
         close(sock);
-        return users;
+        return contacts;
     }
 
-    std::string req = "GET /users HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
+    std::string req = "GET /users HTTP/1.1\r\n"
+                      "Host: " + host + "\r\n"
+                      "Authorization: Bearer " + token + "\r\n"
+                      "Connection: close\r\n\r\n";
+
     send(sock, req.c_str(), req.size(), 0);
 
     std::string response;
@@ -83,71 +150,59 @@ inline std::vector<std::string> fetchOnlineUsers(const std::string& host = "127.
             auto j = nlohmann::json::parse(body);
             if (j.is_array()) {
                 for (const auto& item : j) {
-                    users.push_back(item.get<std::string>());
+                    int64_t id = item.value("id", -1);
+                    std::string uname = item.value("username", "");
+                    bool online = item.value("online", false);
+                    if (!uname.empty() && uname != current_username) {
+                        contacts.push_back({id, uname, online, {}});
+                    }
                 }
             }
         } catch (...) {}
     }
 
-    return users;
+    return contacts;
 }
 
 ChatUI::ChatUI() {
-    sendHttpPost("/join", my_name_);
+    ftxui::InputOption user_option;
+    user_option.multiline = false;
+    login_username_input_ = ftxui::Input(&auth_username_, "Username", user_option);
 
-    heartbeat_thread_ = std::jthread([this](std::stop_token st) {
-        while (!st.stop_requested()) {
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-            if (!st.stop_requested()) {
-                sendHttpPost("/heartbeat", my_name_);
-            }
-        }
+    ftxui::InputOption pass_option;
+    pass_option.multiline = false;
+    pass_option.password = true;
+    login_password_input_ = ftxui::Input(&auth_password_, "Password", pass_option);
+
+    login_btn_ = ftxui::Button("Submit", [this] {
+        PerformAuth(auth_state_ == AuthState::Register);
     });
 
-    auto online_names = fetchOnlineUsers();
-    for (const auto& uname : online_names) {
-        if (uname != my_name_) {
-            contacts_.push_back({uname, uname, {}});
-        }
-    }
-    if (contacts_.empty()) {
-        contacts_ = {
-            {"1", "Bob", {}},
-            {"2", "Charlie", {}}
-        };
-    }
+    switch_btn_ = ftxui::Button("Switch Mode", [this] {
+        auth_state_ = (auth_state_ == AuthState::Login) ? AuthState::Register : AuthState::Login;
+        auth_error_.clear();
+    });
 
-    UpdateFilteredContacts();
+    login_container_ = ftxui::Container::Vertical({
+        login_username_input_,
+        login_password_input_,
+        login_btn_,
+        switch_btn_,
+    });
 
     ftxui::InputOption name_option;
     name_option.multiline = false;
     name_option.on_enter = [this] {
         name_input_text_.erase(std::remove(name_input_text_.begin(), name_input_text_.end(), '\n'), name_input_text_.end());
-        if (!name_input_text_.empty() && name_input_text_ != my_name_) {
-            sendHttpPost("/leave", my_name_);
-            my_name_ = name_input_text_;
-            sendHttpPost("/join", my_name_);
-            editing_name_ = false;
-            name_button_->TakeFocus();
-        } else {
-            editing_name_ = false;
-            name_button_->TakeFocus();
-        }
+        editing_name_ = false;
+        name_button_->TakeFocus();
     };
     my_name_input_ = ftxui::Input(&name_input_text_, "My Name", name_option);
 
     ftxui::InputOption search_option;
     search_option.multiline = false;
     search_option.on_change = [this] {
-        auto online_names = fetchOnlineUsers();
-        contacts_.clear();
-        for (const auto& uname : online_names) {
-            if (uname != my_name_) {
-                contacts_.push_back({uname, uname, {}});
-            }
-        }
-        UpdateFilteredContacts();
-        selected_contact_index_ = 0;
+        RefreshContacts();
     };
     search_input_ = ftxui::Input(&search_query_, "Search contacts...", search_option);
 
@@ -207,19 +262,80 @@ ChatUI::ChatUI() {
         left_container_,
         right_container_,
     }, &active_pane_);
+
+    root_container_ = ftxui::Container::Tab({
+        login_container_,
+        split_container_,
+    }, &active_tab_index_);
 }
 
 ChatUI::~ChatUI() {
-    sendHttpPost("/leave", my_name_);
+    if (auth_state_ == AuthState::LoggedIn && !auth_token_.empty()) {
+        sendAuthenticatedPost("/leave", auth_token_);
+    }
+}
+
+bool ChatUI::PerformAuth(bool is_register) {
+    if (auth_username_.empty() || auth_password_.empty()) {
+        auth_error_ = "Username and password cannot be empty";
+        return false;
+    }
+
+    int64_t uid = -1;
+    std::string token;
+    std::string err;
+    if (sendAuthRequest(is_register, auth_username_, auth_password_, token, uid, err)) {
+        auth_token_ = token;
+        my_user_id_ = uid;
+        my_name_ = auth_username_;
+        auth_state_ = AuthState::LoggedIn;
+        active_tab_index_ = 1; // Switch to chat tab
+        auth_error_.clear();
+
+        sendAuthenticatedPost("/join", auth_token_);
+
+        heartbeat_thread_ = std::jthread([this](std::stop_token st) {
+            while (!st.stop_requested()) {
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                if (!st.stop_requested()) {
+                    sendAuthenticatedPost("/heartbeat", auth_token_);
+                }
+            }
+        });
+
+        RefreshContacts();
+        split_container_->TakeFocus();
+        return true;
+    } else {
+        auth_error_ = err;
+        return false;
+    }
+}
+
+void ChatUI::RefreshContacts() {
+    if (auth_state_ != AuthState::LoggedIn) return;
+    auto online_contacts = fetchOnlineUsersWithAuth(auth_token_, my_name_);
+    
+    for (const auto& new_c : online_contacts) {
+        auto it = std::find_if(contacts_.begin(), contacts_.end(), [&](const Contact& c) { return c.id == new_c.id; });
+        if (it != contacts_.end()) {
+            it->online = new_c.online;
+            it->name = new_c.name;
+        } else {
+            contacts_.push_back(new_c);
+        }
+    }
+    UpdateFilteredContacts();
 }
 
 void ChatUI::UpdateFilteredContacts() {
     filtered_indices_.clear();
     filtered_names_.clear();
     for (size_t i = 0; i < contacts_.size(); ++i) {
+        std::string display_name = contacts_[i].name + (contacts_[i].online ? " [Online]" : " [Offline]");
         if (search_query_.empty() || contacts_[i].name.find(search_query_) != std::string::npos) {
             filtered_indices_.push_back(i);
-            filtered_names_.push_back(contacts_[i].name);
+            filtered_names_.push_back(display_name);
         }
     }
 }
@@ -240,20 +356,30 @@ void ChatUI::SendMessage() {
 }
 
 ftxui::Component ChatUI::GetComponent() {
-    return ftxui::Renderer(split_container_, [this] {
+    return ftxui::Renderer(root_container_, [this] {
         using namespace ftxui;
 
-        auto online_names = fetchOnlineUsers();
-        for (const auto& uname : online_names) {
-            if (uname != my_name_) {
-                auto it = std::find_if(contacts_.begin(), contacts_.end(), [&](const Contact& c) { return c.name == uname; });
-                if (it == contacts_.end()) {
-                    contacts_.push_back({uname, uname, {}});
-                }
+        if (auth_state_ != AuthState::LoggedIn) {
+            Elements elements = Elements{
+                text("=== cim - Command Instant Messenger ===") | bold | color(Color::Cyan) | center,
+                separator(),
+                text(auth_state_ == AuthState::Login ? "Please Login" : "Please Register") | bold | center,
+                separator(),
+                hbox(Elements{text(" Username: "), login_username_input_->Render()}) | border,
+                hbox(Elements{text(" Password: "), login_password_input_->Render()}) | border,
+            };
+
+            if (!auth_error_.empty()) {
+                elements.push_back(text(auth_error_) | color(Color::Red) | bold | center);
             }
+
+            elements.push_back(separator());
+            elements.push_back(hbox(Elements{login_btn_->Render(), text("   "), switch_btn_->Render()}) | center);
+
+            return vbox(elements) | border | center;
         }
 
-        UpdateFilteredContacts();
+        RefreshContacts();
         if (selected_contact_index_ >= (int)filtered_names_.size()) {
             selected_contact_index_ = filtered_names_.empty() ? -1 : (int)filtered_names_.size() - 1;
         }
@@ -272,9 +398,8 @@ ftxui::Component ChatUI::GetComponent() {
             }),
             separator(),
             contact_menu_->Render() | vscroll_indicator | frame | yflex,
-        }) | size(WIDTH, EQUAL, 32);
+        }) | size(WIDTH, EQUAL, 35);
 
-        // Right Pane
         Element right_pane;
         if (selected_contact_index_ < 0 || selected_contact_index_ >= (int)filtered_indices_.size()) {
             right_pane = vbox(Elements{
@@ -332,6 +457,7 @@ ftxui::Component ChatUI::GetComponent() {
             right_pane,
         });
     }) | ftxui::CatchEvent([this](ftxui::Event event) {
+        if (auth_state_ != AuthState::LoggedIn) return false;
         if (editing_name_) {
             return false;
         }

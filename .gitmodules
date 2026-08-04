@@ -7,3 +7,6 @@
 [submodule "vendor/nlohmann_json"]
 	path = vendor/nlohmann_json
 	url = https://github.com/nlohmann/json.git
+[submodule "vendor/libsodium"]
+	path = vendor/libsodium
+	url = https://github.com/jedisct1/libsodium.git
