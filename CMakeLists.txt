@@ -24,8 +24,5 @@ add_executable(cim
 
 target_include_directories(cim PRIVATE src vendor/nlohmann_json/single_include)
 target_link_libraries(cim PRIVATE ftxui::component ixwebsocket::ixwebsocket)
-if(WIN32)
-    target_link_libraries(cim PRIVATE ws2_32)
-endif()
 
 add_subdirectory(server)

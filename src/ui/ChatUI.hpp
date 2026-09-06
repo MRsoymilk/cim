@@ -5,7 +5,6 @@
 #include <atomic>
 #include <string>
 #include <vector>
-#include <thread>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -40,16 +39,12 @@ private:
     enum class SocketEventType {
         Connected,
         Disconnected,
-        Chat,
+        Message,
         Error
     };
 
     struct SocketEvent {
         SocketEventType type;
-        int64_t sender_id = -1;
-        std::string sender_name;
-        int64_t recipient_id = -1;
-        std::string recipient_name;
         std::string content;
     };
 
@@ -95,9 +90,9 @@ private:
     std::vector<int> filtered_indices_;
     std::vector<std::string> filtered_names_;
 
-    std::jthread heartbeat_thread_;
     std::unique_ptr<ix::WebSocket> websocket_;
     std::atomic<bool> websocket_connected_ = false;
+    std::atomic<bool> websocket_authenticated_ = false;
     std::mutex socket_events_mutex_;
     std::deque<SocketEvent> socket_events_;
 
@@ -106,7 +101,6 @@ private:
     void DrainSocketEvents();
     void UpdateFilteredContacts();
     void SendMessage();
-    void RefreshContacts();
 };
 
 } // namespace cim

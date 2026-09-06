@@ -1,99 +1,228 @@
-#include "App.h"
 #include "Database.hpp"
+
+#include <ixwebsocket/IXNetSystem.h>
+#include <ixwebsocket/IXWebSocketServer.h>
 #include <nlohmann/json.hpp>
 #include <sodium.h>
+
+#include <cstdint>
+#include <ctime>
+#include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
-#include <string_view>
-#include <chrono>
-#include <random>
-#include <sstream>
-#include <iomanip>
-#include <utility>
+#include <unordered_set>
+#include <vector>
 
 using json = nlohmann::json;
 
-struct PerSocketData {
+namespace {
+
+struct Session {
     int64_t user_id;
     std::string username;
 };
 
-std::string generateToken() {
-    unsigned char buf[32];
-    randombytes_buf(buf, sizeof(buf));
-    std::stringstream ss;
-    for (int i = 0; i < 32; ++i) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << (int)buf[i];
+std::string GenerateToken() {
+    unsigned char bytes[32];
+    randombytes_buf(bytes, sizeof(bytes));
+    std::stringstream stream;
+    for (unsigned char byte : bytes) {
+        stream << std::hex << std::setw(2) << std::setfill('0')
+               << static_cast<int>(byte);
     }
-    return ss.str();
+    return stream.str();
 }
 
-std::string getAuthToken(std::string_view auth_header) {
-    if (auth_header.starts_with("Bearer ")) {
-        return std::string(auth_header.substr(7));
-    }
-    return "";
-}
+} // namespace
 
 int main() {
     if (sodium_init() < 0) {
-        std::cerr << "[Server] Failed to initialize libsodium!" << std::endl;
+        std::cerr << "[Server] Failed to initialize libsodium" << std::endl;
+        return 1;
+    }
+    if (!ix::initNetSystem()) {
+        std::cerr << "[Server] Failed to initialize network system" << std::endl;
         return 1;
     }
 
     cim::Database db;
     if (!db.init("cim.db")) {
-        std::cerr << "[Server] Failed to initialize database!" << std::endl;
+        ix::uninitNetSystem();
         return 1;
     }
+    db.cleanupExpiredSessions();
 
-    // online_users: username -> last_heartbeat_timestamp
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point> online_users;
+    ix::WebSocketServer server(9001, "0.0.0.0");
+    server.disablePerMessageDeflate();
 
-    uWS::App app;
-    app.ws<PerSocketData>("/ws", {
-        .compression = uWS::DISABLED,
-        .maxPayloadLength = 16 * 1024,
-        .idleTimeout = 60,
-        .upgrade = [&db](auto* res, auto* req, auto* context) {
-            std::string token = getAuthToken(req->getHeader("authorization"));
-            int64_t user_id = -1;
-            std::string username;
-            if (token.empty() || !db.getUserByToken(token, user_id, username)) {
-                res->writeStatus("401 Unauthorized")->end("Unauthorized");
+    std::mutex sessions_mutex;
+    std::unordered_map<ix::WebSocket*, Session> sessions;
+
+    auto authenticatedClients = [&] {
+        std::vector<std::pair<std::shared_ptr<ix::WebSocket>, Session>> clients;
+        auto connected = server.getClients();
+        std::lock_guard lock(sessions_mutex);
+        for (const auto& socket : connected) {
+            auto session = sessions.find(socket.get());
+            if (session != sessions.end()) {
+                clients.emplace_back(socket, session->second);
+            }
+        }
+        return clients;
+    };
+
+    auto broadcastUsers = [&] {
+        auto clients = authenticatedClients();
+        std::unordered_set<int64_t> online_ids;
+        for (const auto& [socket, session] : clients) {
+            online_ids.insert(session.user_id);
+        }
+
+        json users = json::array();
+        for (const auto& [user_id, username] : db.getAllUsers()) {
+            users.push_back({
+                {"id", user_id},
+                {"username", username},
+                {"online", online_ids.contains(user_id)},
+            });
+        }
+        std::string payload = json{{"type", "users"}, {"users", users}}.dump();
+        for (const auto& [socket, session] : clients) {
+            socket->send(payload);
+        }
+    };
+
+    server.setOnClientMessageCallback(
+        [&](std::shared_ptr<ix::ConnectionState>,
+            ix::WebSocket& socket,
+            const ix::WebSocketMessagePtr& message) {
+            if (message->type == ix::WebSocketMessageType::Open) {
+                std::cout << "[WebSocket] Client connected" << std::endl;
+                return;
+            }
+            if (message->type == ix::WebSocketMessageType::Close) {
+                std::string username;
+                {
+                    std::lock_guard lock(sessions_mutex);
+                    auto session = sessions.find(&socket);
+                    if (session != sessions.end()) {
+                        username = session->second.username;
+                        sessions.erase(session);
+                    }
+                }
+                if (!username.empty()) {
+                    std::cout << "[WebSocket] User disconnected: " << username << std::endl;
+                    broadcastUsers();
+                }
+                return;
+            }
+            if (message->type != ix::WebSocketMessageType::Message) {
                 return;
             }
 
-            res->template upgrade<PerSocketData>(
-                {user_id, std::move(username)},
-                req->getHeader("sec-websocket-key"),
-                req->getHeader("sec-websocket-protocol"),
-                req->getHeader("sec-websocket-extensions"),
-                context
-            );
-        },
-        .open = [](auto* ws) {
-            const auto* user = ws->getUserData();
-            ws->subscribe("user:" + std::to_string(user->user_id));
-            std::cout << "[WebSocket] Connected: " << user->username
-                      << " (ID: " << user->user_id << ")" << std::endl;
-        },
-        .message = [&db](auto* ws, std::string_view message, uWS::OpCode op_code) {
-            auto send_error = [ws](std::string_view error) {
-                json response = {{"type", "error"}, {"error", error}};
-                ws->send(response.dump(), uWS::OpCode::TEXT);
+            auto sendError = [&socket](std::string_view error) {
+                socket.send(json{{"type", "error"}, {"error", error}}.dump());
             };
 
-            if (op_code != uWS::OpCode::TEXT) {
-                send_error("Only text messages are supported");
-                return;
-            }
-
             try {
-                auto request = json::parse(message);
-                if (request.value("type", "") != "chat") {
-                    send_error("Unsupported message type");
+                auto request = json::parse(message->str);
+                std::string type = request.value("type", "");
+
+                if (type == "login" || type == "register") {
+                    std::string username = request.value("username", "");
+                    std::string password = request.value("password", "");
+                    if (username.empty() || password.empty()) {
+                        sendError("Username and password are required");
+                        return;
+                    }
+
+                    int64_t user_id = -1;
+                    if (type == "register") {
+                        char password_hash[crypto_pwhash_STRBYTES];
+                        if (crypto_pwhash_str(
+                                password_hash,
+                                password.c_str(),
+                                password.size(),
+                                crypto_pwhash_OPSLIMIT_INTERACTIVE,
+                                crypto_pwhash_MEMLIMIT_INTERACTIVE) != 0) {
+                            sendError("Password hashing failed");
+                            return;
+                        }
+                        user_id = db.registerUser(username, password_hash);
+                        if (user_id < 0) {
+                            sendError("Username already exists");
+                            return;
+                        }
+                    } else {
+                        std::string password_hash;
+                        if (!db.getUser(username, user_id, password_hash) ||
+                            crypto_pwhash_str_verify(
+                                password_hash.c_str(), password.c_str(), password.size()) != 0) {
+                            sendError("Invalid username or password");
+                            return;
+                        }
+                    }
+
+                    std::string token = GenerateToken();
+                    db.createSession(token, user_id, std::time(nullptr) + 86400 * 7);
+                    {
+                        std::lock_guard lock(sessions_mutex);
+                        sessions.insert_or_assign(&socket, Session{user_id, username});
+                    }
+                    socket.send(json{
+                        {"type", "auth_success"},
+                        {"token", token},
+                        {"user_id", user_id},
+                        {"username", username},
+                    }.dump());
+                    std::cout << "[Server] Authenticated: " << username
+                              << " (ID: " << user_id << ")" << std::endl;
+                    broadcastUsers();
+                    return;
+                }
+
+                if (type == "resume") {
+                    int64_t user_id = -1;
+                    std::string username;
+                    std::string token = request.value("token", "");
+                    if (token.empty() || !db.getUserByToken(token, user_id, username)) {
+                        sendError("Session expired; sign in again");
+                        return;
+                    }
+                    {
+                        std::lock_guard lock(sessions_mutex);
+                        sessions.insert_or_assign(&socket, Session{user_id, username});
+                    }
+                    socket.send(json{
+                        {"type", "auth_success"},
+                        {"token", token},
+                        {"user_id", user_id},
+                        {"username", username},
+                    }.dump());
+                    broadcastUsers();
+                    return;
+                }
+
+                Session sender;
+                {
+                    std::lock_guard lock(sessions_mutex);
+                    auto session = sessions.find(&socket);
+                    if (session == sessions.end()) {
+                        sendError("Authentication required");
+                        return;
+                    }
+                    sender = session->second;
+                }
+
+                if (type == "users") {
+                    broadcastUsers();
+                    return;
+                }
+                if (type != "chat") {
+                    sendError("Unsupported message type");
                     return;
                 }
 
@@ -101,267 +230,43 @@ int main() {
                 std::string content = request.value("content", "");
                 std::string recipient_name;
                 if (recipient_id < 0 || !db.getUserById(recipient_id, recipient_name)) {
-                    send_error("Recipient not found");
+                    sendError("Recipient not found");
                     return;
                 }
                 if (content.empty() || content.size() > 4096) {
-                    send_error("Message must contain between 1 and 4096 bytes");
+                    sendError("Message must contain between 1 and 4096 bytes");
                     return;
                 }
 
-                const auto* sender = ws->getUserData();
-                json response = {
+                std::string payload = json{
                     {"type", "chat"},
-                    {"sender_id", sender->user_id},
-                    {"sender_name", sender->username},
+                    {"sender_id", sender.user_id},
+                    {"sender_name", sender.username},
                     {"recipient_id", recipient_id},
                     {"recipient_name", recipient_name},
                     {"content", content},
-                };
-                std::string payload = response.dump();
-
-                // A socket does not receive its own publications, so acknowledge it directly.
-                ws->send(payload, uWS::OpCode::TEXT);
-                ws->publish("user:" + std::to_string(sender->user_id), payload, uWS::OpCode::TEXT);
-                if (recipient_id != sender->user_id) {
-                    ws->publish("user:" + std::to_string(recipient_id), payload, uWS::OpCode::TEXT);
+                }.dump();
+                for (const auto& [client, session] : authenticatedClients()) {
+                    if (session.user_id == sender.user_id || session.user_id == recipient_id) {
+                        client->send(payload);
+                    }
                 }
             } catch (const json::exception&) {
-                send_error("Invalid message JSON");
-            }
-        },
-        .close = [](auto* ws, int, std::string_view) {
-            const auto* user = ws->getUserData();
-            std::cout << "[WebSocket] Disconnected: " << user->username
-                      << " (ID: " << user->user_id << ")" << std::endl;
-        },
-    }).post("/auth/register", [&db](auto* res, auto* req) {
-        std::string* buffer = new std::string();
-        res->onData([res, buffer, &db](std::string_view chunk, bool last) {
-            buffer->append(chunk.data(), chunk.length());
-            if (last) {
-                json response;
-                try {
-                    auto j = json::parse(*buffer);
-                    std::string username = j.value("username", "");
-                    std::string password = j.value("password", "");
-
-                    if (username.empty() || password.empty()) {
-                        res->writeStatus("400 Bad Request");
-                        response["error"] = "Username and password required";
-                    } else {
-                        char hash[crypto_pwhash_STRBYTES];
-                        if (crypto_pwhash_str(hash, password.c_str(), password.size(),
-                                              crypto_pwhash_OPSLIMIT_INTERACTIVE,
-                                              crypto_pwhash_MEMLIMIT_INTERACTIVE) != 0) {
-                            res->writeStatus("500 Internal Server Error");
-                            response["error"] = "Password hashing failed";
-                        } else {
-                            int64_t user_id = db.registerUser(username, hash);
-                            if (user_id < 0) {
-                                res->writeStatus("409 Conflict");
-                                response["error"] = "Username already exists";
-                            } else {
-                                std::string token = generateToken();
-                                int64_t expires_at = std::time(nullptr) + 86400 * 7; // 7 days
-                                db.createSession(token, user_id, expires_at);
-
-                                response["success"] = true;
-                                response["user_id"] = user_id;
-                                response["username"] = username;
-                                response["token"] = token;
-                                std::cout << "[Server] Registered & Logged in: " << username << " (ID: " << user_id << ")" << std::endl;
-                            }
-                        }
-                    }
-                } catch (...) {
-                    res->writeStatus("400 Bad Request");
-                    response["error"] = "Invalid JSON";
-                }
-                delete buffer;
-                res->writeHeader("Content-Type", "application/json");
-                res->end(response.dump());
-            }
-        });
-        res->onAborted([buffer]() {
-            delete buffer;
-        });
-    }).post("/auth/login", [&db](auto* res, auto* req) {
-        std::string* buffer = new std::string();
-        res->onData([res, buffer, &db](std::string_view chunk, bool last) {
-            buffer->append(chunk.data(), chunk.length());
-            if (last) {
-                json response;
-                try {
-                    auto j = json::parse(*buffer);
-                    std::string username = j.value("username", "");
-                    std::string password = j.value("password", "");
-
-                    int64_t user_id = -1;
-                    std::string stored_hash;
-                    if (db.getUser(username, user_id, stored_hash) &&
-                        crypto_pwhash_str_verify(stored_hash.c_str(), password.c_str(), password.size()) == 0) {
-                        
-                        std::string token = generateToken();
-                        int64_t expires_at = std::time(nullptr) + 86400 * 7;
-                        db.createSession(token, user_id, expires_at);
-
-                        response["success"] = true;
-                        response["user_id"] = user_id;
-                        response["username"] = username;
-                        response["token"] = token;
-                        std::cout << "[Server] User logged in: " << username << " (ID: " << user_id << ")" << std::endl;
-                    } else {
-                        res->writeStatus("401 Unauthorized");
-                        response["error"] = "Invalid username or password";
-                    }
-                } catch (...) {
-                    res->writeStatus("400 Bad Request");
-                    response["error"] = "Invalid JSON";
-                }
-                delete buffer;
-                res->writeHeader("Content-Type", "application/json");
-                res->end(response.dump());
-            }
-        });
-        res->onAborted([buffer]() {
-            delete buffer;
-        });
-    }).get("/users", [&db, &online_users](auto* res, auto* req) {
-        std::string auth_header(req->getHeader("authorization"));
-        std::string token = getAuthToken(auth_header);
-
-        int64_t user_id = -1;
-        std::string username;
-        if (token.empty() || !db.getUserByToken(token, user_id, username)) {
-            res->writeStatus("401 Unauthorized");
-            res->end("{\"error\":\"Unauthorized\"}");
-            return;
-        }
-
-        auto now = std::chrono::steady_clock::now();
-        for (auto it = online_users.begin(); it != online_users.end(); ) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count();
-            if (elapsed > 9) {
-                std::cout << "[Server] <<< User Left (Timeout): " << it->first << " | Total Online Users: " << (online_users.size() - 1) << std::endl;
-                it = online_users.erase(it);
-            } else {
-                ++it;
+                sendError("Invalid message JSON");
             }
         }
+    );
 
-        json users_arr = json::array();
-        auto all_users = db.getAllUsers();
-        for (const auto& [u_id, u_name] : all_users) {
-            json u;
-            u["id"] = u_id;
-            u["username"] = u_name;
-            u["online"] = online_users.count(u_name) > 0;
-            users_arr.push_back(u);
-        }
+    auto [listening, error] = server.listen();
+    if (!listening) {
+        std::cerr << "[cim-server] Failed to listen on port 9001: " << error << std::endl;
+        ix::uninitNetSystem();
+        return 1;
+    }
 
-        res->writeHeader("Content-Type", "application/json");
-        res->end(users_arr.dump());
-    }).post("/join", [&db, &online_users](auto* res, auto* req) {
-        std::string auth_header(req->getHeader("authorization"));
-        std::string token = getAuthToken(auth_header);
-
-        std::string* buffer = new std::string();
-        res->onData([res, buffer, token, &db, &online_users](std::string_view chunk, bool last) {
-            buffer->append(chunk.data(), chunk.length());
-            if (last) {
-                int64_t user_id = -1;
-                std::string username;
-                if (token.empty() || !db.getUserByToken(token, user_id, username)) {
-                    res->writeStatus("401 Unauthorized");
-                    res->end("{\"error\":\"Unauthorized\"}");
-                    delete buffer;
-                    return;
-                }
-
-                bool is_new = online_users.find(username) == online_users.end();
-                online_users[username] = std::chrono::steady_clock::now();
-                if (is_new) {
-                    std::cout << "[Server] >>> User Joined: " << username << " (ID: " << user_id << ") | Total Online Users: " << online_users.size() << std::endl;
-                }
-
-                delete buffer;
-                res->writeHeader("Content-Type", "application/json");
-                res->end("{\"status\":\"ok\"}");
-            }
-        });
-        res->onAborted([buffer]() {
-            delete buffer;
-        });
-    }).post("/heartbeat", [&db, &online_users](auto* res, auto* req) {
-        std::string auth_header(req->getHeader("authorization"));
-        std::string token = getAuthToken(auth_header);
-
-        std::string* buffer = new std::string();
-        res->onData([res, buffer, token, &db, &online_users](std::string_view chunk, bool last) {
-            buffer->append(chunk.data(), chunk.length());
-            if (last) {
-                int64_t user_id = -1;
-                std::string username;
-                if (token.empty() || !db.getUserByToken(token, user_id, username)) {
-                    res->writeStatus("401 Unauthorized");
-                    res->end("{\"error\":\"Unauthorized\"}");
-                    delete buffer;
-                    return;
-                }
-
-                bool is_new = online_users.find(username) == online_users.end();
-                online_users[username] = std::chrono::steady_clock::now();
-                if (is_new) {
-                    std::cout << "[Server] >>> User Joined (Heartbeat): " << username << " (ID: " << user_id << ") | Total Online Users: " << online_users.size() << std::endl;
-                }
-
-                delete buffer;
-                res->writeHeader("Content-Type", "application/json");
-                res->end("{\"status\":\"ok\"}");
-            }
-        });
-        res->onAborted([buffer]() {
-            delete buffer;
-        });
-    }).post("/leave", [&db, &online_users](auto* res, auto* req) {
-        std::string auth_header(req->getHeader("authorization"));
-        std::string token = getAuthToken(auth_header);
-
-        std::string* buffer = new std::string();
-        res->onData([res, buffer, token, &db, &online_users](std::string_view chunk, bool last) {
-            buffer->append(chunk.data(), chunk.length());
-            if (last) {
-                int64_t user_id = -1;
-                std::string username;
-                if (token.empty() || !db.getUserByToken(token, user_id, username)) {
-                    res->writeStatus("401 Unauthorized");
-                    res->end("{\"error\":\"Unauthorized\"}");
-                    delete buffer;
-                    return;
-                }
-
-                if (online_users.count(username)) {
-                    online_users.erase(username);
-                    std::cout << "[Server] <<< User Left: " << username << " (ID: " << user_id << ") | Total Online Users: " << online_users.size() << std::endl;
-                }
-                db.deleteSession(token);
-
-                delete buffer;
-                res->writeHeader("Content-Type", "application/json");
-                res->end("{\"status\":\"ok\"}");
-            }
-        });
-        res->onAborted([buffer]() {
-            delete buffer;
-        });
-    }).listen(9001, [](auto* listen_socket) {
-        if (listen_socket) {
-            std::cout << "[cim-server] Relay server with SQLite & Auth listening on port 9001..." << std::endl;
-        } else {
-            std::cerr << "[cim-server] Failed to listen on port 9001!" << std::endl;
-        }
-    }).run();
-
+    std::cout << "[cim-server] IXWebSocket server listening on port 9001" << std::endl;
+    server.start();
+    server.wait();
+    ix::uninitNetSystem();
     return 0;
 }

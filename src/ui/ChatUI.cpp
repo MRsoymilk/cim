@@ -6,224 +6,10 @@
 #include <ixwebsocket/IXWebSocket.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
-#include <chrono>
 #include <iterator>
 #include <utility>
 
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#pragma comment(lib, "ws2_32.lib")
-#else
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <netdb.h>
-#endif
-
 namespace cim {
-
-class WinSockInitializer {
-public:
-    WinSockInitializer() {
-#ifdef _WIN32
-        WSADATA wsaData;
-        WSAStartup(MAKEWORD(2, 2), &wsaData);
-#endif
-    }
-    ~WinSockInitializer() {
-#ifdef _WIN32
-        WSACleanup();
-#endif
-    }
-};
-
-inline void closeSocket(int sock) {
-#ifdef _WIN32
-    closesocket(sock);
-#else
-    close(sock);
-#endif
-}
-
-inline int createSocket() {
-#ifdef _WIN32
-    return static_cast<int>(socket(AF_INET, SOCK_STREAM, 0));
-#else
-    return socket(AF_INET, SOCK_STREAM, 0);
-#endif
-}
-
-inline bool sendAuthRequest(bool is_register, const std::string& username, const std::string& password, std::string& token_out, int64_t& id_out, std::string& error_out, const std::string& host = "127.0.0.1", int port = 9001) {
-    static WinSockInitializer ws_init;
-    int sock = createSocket();
-    if (sock < 0) {
-        error_out = "Socket creation failed";
-        return false;
-    }
-
-    sockaddr_in serv_addr{};
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &serv_addr.sin_addr);
-
-#ifdef _WIN32
-    DWORD tv = 2000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-#else
-    struct timeval tv;
-    tv.tv_sec = 2;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-#endif
-
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        closeSocket(sock);
-        error_out = "Connection to server failed";
-        return false;
-    }
-
-    nlohmann::json j;
-    j["username"] = username;
-    j["password"] = password;
-    std::string body = j.dump();
-
-    std::string endpoint = is_register ? "/auth/register" : "/auth/login";
-    std::string req = "POST " + endpoint + " HTTP/1.1\r\n"
-                      "Host: " + host + "\r\n"
-                      "Content-Type: application/json\r\n"
-                      "Content-Length: " + std::to_string(body.size()) + "\r\n"
-                      "Connection: close\r\n\r\n" + body;
-
-    send(sock, req.c_str(), (int)req.size(), 0);
-
-    std::string response;
-    char buffer[4096];
-    int bytes_received = 0;
-    while ((bytes_received = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0';
-        response += buffer;
-    }
-    closeSocket(sock);
-
-    size_t body_pos = response.find("\r\n\r\n");
-    if (body_pos != std::string::npos) {
-        std::string resp_body = response.substr(body_pos + 4);
-        try {
-            auto res_json = nlohmann::json::parse(resp_body);
-            if (res_json.contains("success") && res_json["success"].get<bool>()) {
-                token_out = res_json.value("token", "");
-                id_out = res_json.value("user_id", -1);
-                return true;
-            } else {
-                error_out = res_json.value("error", "Authentication failed");
-            }
-        } catch (...) {
-            error_out = "Invalid response from server";
-        }
-    } else {
-        error_out = "No response from server";
-    }
-    return false;
-}
-
-inline void sendAuthenticatedPost(const std::string& endpoint, const std::string& token, const std::string& host = "127.0.0.1", int port = 9001) {
-    static WinSockInitializer ws_init;
-    int sock = createSocket();
-    if (sock < 0) return;
-
-    sockaddr_in serv_addr{};
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &serv_addr.sin_addr);
-
-#ifdef _WIN32
-    DWORD tv = 1000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-#else
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-#endif
-
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        closeSocket(sock);
-        return;
-    }
-
-    std::string req = "POST " + endpoint + " HTTP/1.1\r\n"
-                      "Host: " + host + "\r\n"
-                      "Authorization: Bearer " + token + "\r\n"
-                      "Content-Length: 0\r\n"
-                      "Connection: close\r\n\r\n";
-
-    send(sock, req.c_str(), (int)req.size(), 0);
-    closeSocket(sock);
-}
-
-inline std::vector<Contact> fetchOnlineUsersWithAuth(const std::string& token, const std::string& current_username, const std::string& host = "127.0.0.1", int port = 9001) {
-    static WinSockInitializer ws_init;
-    std::vector<Contact> contacts;
-    int sock = createSocket();
-    if (sock < 0) return contacts;
-
-    sockaddr_in serv_addr{};
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &serv_addr.sin_addr);
-
-#ifdef _WIN32
-    DWORD tv = 1000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-#else
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-#endif
-
-    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        closeSocket(sock);
-        return contacts;
-    }
-
-    std::string req = "GET /users HTTP/1.1\r\n"
-                      "Host: " + host + "\r\n"
-                      "Authorization: Bearer " + token + "\r\n"
-                      "Connection: close\r\n\r\n";
-
-    send(sock, req.c_str(), (int)req.size(), 0);
-
-    std::string response;
-    char buffer[4096];
-    int bytes_received = 0;
-    while ((bytes_received = recv(sock, buffer, sizeof(buffer) - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0';
-        response += buffer;
-    }
-    closeSocket(sock);
-
-    size_t body_pos = response.find("\r\n\r\n");
-    if (body_pos != std::string::npos) {
-        std::string body = response.substr(body_pos + 4);
-        try {
-            auto j = nlohmann::json::parse(body);
-            if (j.is_array()) {
-                for (const auto& item : j) {
-                    int64_t id = item.value("id", -1);
-                    std::string uname = item.value("username", "");
-                    bool online = item.value("online", false);
-                    if (!uname.empty() && uname != current_username) {
-                        contacts.push_back({id, uname, online, {}});
-                    }
-                }
-            }
-        } catch (...) {}
-    }
-
-    return contacts;
-}
 
 ChatUI::ChatUI(ftxui::Closure request_refresh)
     : request_refresh_(std::move(request_refresh)) {
@@ -309,7 +95,7 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
     ftxui::InputOption search_option;
     search_option.multiline = false;
     search_option.on_change = [this] {
-        RefreshContacts();
+        UpdateFilteredContacts();
     };
     search_input_ = ftxui::Input(&search_query_, "Search contacts...", search_option);
 
@@ -374,16 +160,14 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
         login_container_,
         split_container_,
     }, &active_tab_index_);
+
+    ConnectWebSocket();
 }
 
 ChatUI::~ChatUI() {
-    heartbeat_thread_.request_stop();
     if (websocket_) {
         websocket_->stop();
         websocket_.reset();
-    }
-    if (auth_state_ == AuthState::LoggedIn && !auth_token_.empty()) {
-        sendAuthenticatedPost("/leave", auth_token_);
     }
     ix::uninitNetSystem();
 }
@@ -394,77 +178,51 @@ bool ChatUI::PerformAuth(bool is_register) {
         return false;
     }
 
-    int64_t uid = -1;
-    std::string token;
-    std::string err;
-    if (sendAuthRequest(is_register, auth_username_, auth_password_, token, uid, err)) {
-        auth_token_ = token;
-        my_user_id_ = uid;
-        my_name_ = auth_username_;
-        auth_state_ = AuthState::LoggedIn;
-        active_tab_index_ = 1; // Switch to chat tab
-        auth_error_.clear();
-
-        sendAuthenticatedPost("/join", auth_token_);
-        ConnectWebSocket();
-
-        heartbeat_thread_ = std::jthread([this](std::stop_token st) {
-            while (!st.stop_requested()) {
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-                if (!st.stop_requested()) {
-                    sendAuthenticatedPost("/heartbeat", auth_token_);
-                }
-            }
-        });
-
-        RefreshContacts();
-        split_container_->TakeFocus();
-        return true;
-    } else {
-        auth_error_ = err;
+    if (!websocket_connected_) {
+        auth_error_ = "Server is not connected";
         return false;
     }
+
+    nlohmann::json request = {
+        {"type", is_register ? "register" : "login"},
+        {"username", auth_username_},
+        {"password", auth_password_},
+    };
+    auto result = websocket_->send(request.dump());
+    if (!result.success) {
+        auth_error_ = "Failed to send authentication request";
+        return false;
+    }
+    auth_error_.clear();
+    return true;
 }
 
 void ChatUI::ConnectWebSocket() {
-    websocket_->setUrl("ws://127.0.0.1:9001/ws");
+    websocket_->setUrl("ws://127.0.0.1:9001");
     websocket_->setPingInterval(30);
-    websocket_->setExtraHeaders({{"Authorization", "Bearer " + auth_token_}});
     websocket_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& message) {
         SocketEvent event;
         switch (message->type) {
             case ix::WebSocketMessageType::Open:
                 websocket_connected_ = true;
+                websocket_authenticated_ = false;
                 event.type = SocketEventType::Connected;
                 break;
             case ix::WebSocketMessageType::Close:
                 websocket_connected_ = false;
+                websocket_authenticated_ = false;
                 event.type = SocketEventType::Disconnected;
                 event.content = message->closeInfo.reason;
                 break;
             case ix::WebSocketMessageType::Error:
                 websocket_connected_ = false;
+                websocket_authenticated_ = false;
                 event.type = SocketEventType::Error;
                 event.content = message->errorInfo.reason;
                 break;
             case ix::WebSocketMessageType::Message:
-                try {
-                    auto payload = nlohmann::json::parse(message->str);
-                    if (payload.value("type", "") == "chat") {
-                        event.type = SocketEventType::Chat;
-                        event.sender_id = payload.value("sender_id", int64_t{-1});
-                        event.sender_name = payload.value("sender_name", "");
-                        event.recipient_id = payload.value("recipient_id", int64_t{-1});
-                        event.recipient_name = payload.value("recipient_name", "");
-                        event.content = payload.value("content", "");
-                    } else {
-                        event.type = SocketEventType::Error;
-                        event.content = payload.value("error", "Unsupported server message");
-                    }
-                } catch (const nlohmann::json::exception&) {
-                    event.type = SocketEventType::Error;
-                    event.content = "Invalid WebSocket response";
-                }
+                event.type = SocketEventType::Message;
+                event.content = message->str;
                 break;
             default:
                 return;
@@ -488,44 +246,101 @@ void ChatUI::DrainSocketEvents() {
 
     for (auto& event : events) {
         if (event.type == SocketEventType::Connected) {
-            notification_.clear();
+            if (!auth_token_.empty()) {
+                websocket_->send(nlohmann::json{
+                    {"type", "resume"},
+                    {"token", auth_token_},
+                }.dump());
+            } else {
+                auth_error_.clear();
+            }
             continue;
         }
         if (event.type == SocketEventType::Disconnected) {
-            notification_ = "WebSocket disconnected";
+            if (auth_state_ == AuthState::LoggedIn) {
+                notification_ = "Disconnected; reconnecting...";
+            } else {
+                auth_error_ = "Disconnected; reconnecting...";
+            }
             continue;
         }
         if (event.type == SocketEventType::Error) {
-            notification_ = "WebSocket: " + event.content;
+            if (auth_state_ == AuthState::LoggedIn) {
+                notification_ = "WebSocket: " + event.content;
+            } else {
+                auth_error_ = "WebSocket: " + event.content;
+            }
             continue;
         }
 
-        const bool is_me = event.sender_id == my_user_id_;
-        const int64_t contact_id = is_me ? event.recipient_id : event.sender_id;
-        const std::string& contact_name = is_me ? event.recipient_name : event.sender_name;
-        auto contact = std::find_if(contacts_.begin(), contacts_.end(), [contact_id](const Contact& item) {
-            return item.id == contact_id;
-        });
-        if (contact == contacts_.end()) {
-            contacts_.push_back({contact_id, contact_name, true, {}});
-            contact = std::prev(contacts_.end());
+        auto payload = nlohmann::json::parse(event.content, nullptr, false);
+        if (payload.is_discarded()) {
+            notification_ = "Invalid WebSocket response";
+            continue;
         }
-        contact->messages.push_back({is_me, std::move(event.content)});
-    }
-    UpdateFilteredContacts();
-}
 
-void ChatUI::RefreshContacts() {
-    if (auth_state_ != AuthState::LoggedIn) return;
-    auto online_contacts = fetchOnlineUsersWithAuth(auth_token_, my_name_);
-    
-    for (const auto& new_c : online_contacts) {
-        auto it = std::find_if(contacts_.begin(), contacts_.end(), [&](const Contact& c) { return c.id == new_c.id; });
-        if (it != contacts_.end()) {
-            it->online = new_c.online;
-            it->name = new_c.name;
-        } else {
-            contacts_.push_back(new_c);
+        std::string type = payload.value("type", "");
+        if (type == "error") {
+            std::string error = payload.value("error", "Server error");
+            if (auth_state_ == AuthState::LoggedIn) {
+                notification_ = error;
+            } else {
+                auth_error_ = error;
+            }
+            continue;
+        }
+        if (type == "auth_success") {
+            auth_token_ = payload.value("token", "");
+            my_user_id_ = payload.value("user_id", int64_t{-1});
+            my_name_ = payload.value("username", auth_username_);
+            auth_password_.clear();
+            auth_state_ = AuthState::LoggedIn;
+            websocket_authenticated_ = true;
+            active_tab_index_ = 1;
+            auth_error_.clear();
+            notification_.clear();
+            websocket_->send(nlohmann::json{{"type", "users"}}.dump());
+            split_container_->TakeFocus();
+            continue;
+        }
+        if (type == "users") {
+            for (auto& contact : contacts_) {
+                contact.online = false;
+            }
+            for (const auto& user : payload.value("users", nlohmann::json::array())) {
+                int64_t user_id = user.value("id", int64_t{-1});
+                std::string username = user.value("username", "");
+                if (user_id == my_user_id_ || username.empty()) {
+                    continue;
+                }
+                auto contact = std::find_if(contacts_.begin(), contacts_.end(), [user_id](const Contact& item) {
+                    return item.id == user_id;
+                });
+                if (contact == contacts_.end()) {
+                    contacts_.push_back({user_id, username, user.value("online", false), {}});
+                } else {
+                    contact->name = username;
+                    contact->online = user.value("online", false);
+                }
+            }
+            continue;
+        }
+        if (type == "chat") {
+            int64_t sender_id = payload.value("sender_id", int64_t{-1});
+            int64_t recipient_id = payload.value("recipient_id", int64_t{-1});
+            const bool is_me = sender_id == my_user_id_;
+            const int64_t contact_id = is_me ? recipient_id : sender_id;
+            std::string contact_name = is_me
+                ? payload.value("recipient_name", "")
+                : payload.value("sender_name", "");
+            auto contact = std::find_if(contacts_.begin(), contacts_.end(), [contact_id](const Contact& item) {
+                return item.id == contact_id;
+            });
+            if (contact == contacts_.end()) {
+                contacts_.push_back({contact_id, contact_name, true, {}});
+                contact = std::prev(contacts_.end());
+            }
+            contact->messages.push_back({is_me, payload.value("content", "")});
         }
     }
     UpdateFilteredContacts();
@@ -550,8 +365,8 @@ void ChatUI::SendMessage() {
         chat_input_text_.erase(std::remove(chat_input_text_.begin(), chat_input_text_.end(), '\n'), chat_input_text_.end());
         if (chat_input_text_.empty()) {
             notification_ = "Warning: Cannot send empty message!";
-        } else if (!websocket_connected_) {
-            notification_ = "WebSocket is not connected";
+        } else if (!websocket_authenticated_) {
+            notification_ = "WebSocket is not authenticated";
         } else {
             nlohmann::json message = {
                 {"type", "chat"},
@@ -615,7 +430,6 @@ ftxui::Component ChatUI::GetComponent() {
             return card | center;
         }
 
-        RefreshContacts();
         if (selected_contact_index_ >= (int)filtered_names_.size()) {
             selected_contact_index_ = filtered_names_.empty() ? -1 : (int)filtered_names_.size() - 1;
         }
