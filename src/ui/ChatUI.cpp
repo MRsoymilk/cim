@@ -6,6 +6,8 @@
 #include <ixwebsocket/IXWebSocket.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <charconv>
+#include <cctype>
 #include <ctime>
 #include <iomanip>
 #include <iterator>
@@ -37,12 +39,24 @@ std::string FormatTimestamp(int64_t timestamp) {
     return output.str();
 }
 
+std::string Trim(std::string value) {
+    auto is_not_space = [](unsigned char character) {
+        return !std::isspace(character);
+    };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), is_not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), is_not_space).base(), value.end());
+    return value;
+}
+
 } // namespace
 
 ChatUI::ChatUI(ftxui::Closure request_refresh)
     : request_refresh_(std::move(request_refresh)) {
     ix::initNetSystem();
     websocket_ = std::make_unique<ix::WebSocket>();
+    client_config_ = ClientConfig::Load();
+    settings_host_ = client_config_.host;
+    settings_port_ = std::to_string(client_config_.port);
 
     ftxui::InputOption user_option;
     user_option.multiline = false;
@@ -104,11 +118,47 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
         auth_error_.clear();
     }, secondary_button);
 
+    login_settings_btn_ = ftxui::Button("Server settings", [this] {
+        OpenSettings();
+    }, secondary_button);
+
+    chat_settings_btn_ = ftxui::Button("Settings", [this] {
+        OpenSettings();
+    }, secondary_button);
+
+    ftxui::InputOption settings_input_option;
+    settings_input_option.multiline = false;
+    settings_input_option.transform = user_option.transform;
+    settings_host_input_ = ftxui::Input(
+        &settings_host_, "127.0.0.1 or server.example.com", settings_input_option);
+    settings_port_input_ = ftxui::Input(&settings_port_, "9001", settings_input_option);
+
+    settings_save_btn_ = ftxui::Button("SAVE & RECONNECT", [this] {
+        SaveSettings();
+    }, primary_button);
+    settings_back_btn_ = ftxui::Button("BACK", [this] {
+        settings_error_.clear();
+        active_tab_index_ = settings_return_tab_index_;
+        if (active_tab_index_ == 1) {
+            split_container_->TakeFocus();
+        } else {
+            login_container_->TakeFocus();
+        }
+    }, secondary_button);
+
     login_container_ = ftxui::Container::Vertical({
         login_username_input_,
         login_password_input_,
         login_btn_,
         switch_btn_,
+        login_settings_btn_,
+    });
+
+    settings_container_ = ftxui::Container::Vertical({
+        settings_host_input_,
+        settings_port_input_,
+        settings_save_btn_,
+        settings_back_btn_,
     });
 
     ftxui::InputOption name_option;
@@ -171,6 +221,7 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
 
     left_container_ = ftxui::Container::Vertical({
         name_button_,
+        chat_settings_btn_,
         search_input_,
         contact_menu_,
     });
@@ -187,6 +238,7 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
     root_container_ = ftxui::Container::Tab({
         login_container_,
         split_container_,
+        settings_container_,
     }, &active_tab_index_);
 
     ConnectWebSocket();
@@ -225,8 +277,80 @@ bool ChatUI::PerformAuth(bool is_register) {
     return true;
 }
 
+void ChatUI::OpenSettings() {
+    settings_return_tab_index_ = active_tab_index_;
+    settings_host_ = client_config_.host;
+    settings_port_ = std::to_string(client_config_.port);
+    settings_error_.clear();
+    active_tab_index_ = 2;
+    settings_host_input_->TakeFocus();
+}
+
+void ChatUI::SaveSettings() {
+    std::string host = Trim(settings_host_);
+    if (host.empty()) {
+        settings_error_ = "Server address cannot be empty";
+        return;
+    }
+    if (host.find("://") != std::string::npos || host.find('/') != std::string::npos ||
+        std::any_of(host.begin(), host.end(), [](unsigned char character) {
+            return std::isspace(character);
+        })) {
+        settings_error_ = "Enter an IP address or hostname, not a URL";
+        return;
+    }
+
+    unsigned int port = 0;
+    const char* begin = settings_port_.data();
+    const char* end = begin + settings_port_.size();
+    auto [position, error] = std::from_chars(begin, end, port);
+    if (error != std::errc{} || position != end || port == 0 || port > 65535) {
+        settings_error_ = "Port must be a number between 1 and 65535";
+        return;
+    }
+
+    ClientConfig updated{host, static_cast<uint16_t>(port)};
+    if (!updated.Save(settings_error_)) {
+        return;
+    }
+    client_config_ = std::move(updated);
+    ReconnectWebSocket();
+}
+
+void ChatUI::ReconnectWebSocket() {
+    if (websocket_) {
+        websocket_->stop();
+        websocket_.reset();
+    }
+    {
+        std::lock_guard lock(socket_events_mutex_);
+        socket_events_.clear();
+    }
+
+    websocket_connected_ = false;
+    websocket_authenticated_ = false;
+    auth_token_.clear();
+    auth_password_.clear();
+    my_user_id_ = -1;
+    my_name_.clear();
+    contacts_.clear();
+    filtered_indices_.clear();
+    filtered_names_.clear();
+    selected_contact_index_ = 0;
+    notification_.clear();
+    auth_error_.clear();
+    auth_state_ = AuthState::Login;
+    auth_action_label_ = "SIGN IN";
+    auth_switch_label_ = "New here? Create an account";
+    active_tab_index_ = 0;
+
+    websocket_ = std::make_unique<ix::WebSocket>();
+    ConnectWebSocket();
+    login_container_->TakeFocus();
+}
+
 void ChatUI::ConnectWebSocket() {
-    websocket_->setUrl("ws://127.0.0.1:9001");
+    websocket_->setUrl(client_config_.WebSocketUrl());
     websocket_->setPingInterval(30);
     websocket_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& message) {
         SocketEvent event;
@@ -420,6 +544,52 @@ ftxui::Component ChatUI::GetComponent() {
     return ftxui::Renderer(root_container_, [this] {
         using namespace ftxui;
 
+        if (active_tab_index_ == 2) {
+            auto host_field = vbox(Elements{
+                text("SERVER ADDRESS") | color(Color::GrayDark),
+                hbox(Elements{
+                    text(" > ") | bold | color(Color::Cyan),
+                    settings_host_input_->Render() | flex,
+                }) | borderLight,
+            });
+            auto port_field = vbox(Elements{
+                text("PORT") | color(Color::GrayDark),
+                hbox(Elements{
+                    text(" > ") | bold | color(Color::Cyan),
+                    settings_port_input_->Render() | flex,
+                }) | borderLight,
+            });
+            auto status = websocket_connected_
+                ? text("CONNECTED") | bold | color(Color::Green)
+                : text("CONNECTING...") | color(Color::Yellow);
+            auto error = settings_error_.empty()
+                ? text(" ")
+                : text("! " + settings_error_) | bold | color(Color::RedLight);
+
+            auto card = vbox(Elements{
+                text("SERVER SETTINGS") | bold | color(Color::Cyan) | center,
+                text("Configure where cim connects") | color(Color::GrayDark) | center,
+                separator(),
+                hbox(Elements{
+                    text(" Current: ") | color(Color::GrayDark),
+                    text(client_config_.WebSocketUrl()),
+                    filler(),
+                    status,
+                    text(" "),
+                }),
+                text(" "),
+                host_field,
+                text(" "),
+                port_field,
+                error | center,
+                settings_save_btn_->Render() | size(WIDTH, EQUAL, 48) | hcenter,
+                text(" "),
+                settings_back_btn_->Render() | center,
+            }) | size(WIDTH, EQUAL, 56) | borderRounded;
+
+            return card | center;
+        }
+
         if (auth_state_ != AuthState::LoggedIn) {
             const bool is_login = auth_state_ == AuthState::Login;
             auto username_field = vbox(Elements{
@@ -457,6 +627,7 @@ ftxui::Component ChatUI::GetComponent() {
                 login_btn_->Render() | size(WIDTH, EQUAL, 44) | hcenter,
                 text(" "),
                 switch_btn_->Render() | center,
+                login_settings_btn_->Render() | center,
             }) | size(WIDTH, EQUAL, 50) | borderRounded;
 
             return card | center;
@@ -472,6 +643,8 @@ ftxui::Component ChatUI::GetComponent() {
             hbox(Elements{
                 text(" USER: ") | bold | color(Color::Cyan),
                 editing_name_ ? my_name_input_->Render() : name_button_->Render(),
+                filler(),
+                chat_settings_btn_->Render(),
             }),
             separator(),
             hbox(Elements{
@@ -551,6 +724,7 @@ ftxui::Component ChatUI::GetComponent() {
             DrainSocketEvents();
             return true;
         }
+        if (active_tab_index_ == 2) return false;
         if (auth_state_ != AuthState::LoggedIn) return false;
         if (editing_name_ ) {
             return false;

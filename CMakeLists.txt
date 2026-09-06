@@ -19,6 +19,7 @@ add_subdirectory(vendor/IXWebSocket)
 
 add_executable(cim 
     src/main.cpp
+    src/ClientConfig.cpp
     src/ui/ChatUI.cpp
 )
 
