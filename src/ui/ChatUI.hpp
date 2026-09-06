@@ -33,6 +33,8 @@ private:
     std::string auth_password_ = "";
     std::string auth_error_ = "";
     std::string auth_token_ = "";
+    std::string auth_action_label_ = "SIGN IN";
+    std::string auth_switch_label_ = "New here? Create an account";
     int64_t my_user_id_ = -1;
     std::string my_name_ = "";
 

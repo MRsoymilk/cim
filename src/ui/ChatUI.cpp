@@ -224,21 +224,63 @@ inline std::vector<Contact> fetchOnlineUsersWithAuth(const std::string& token, c
 ChatUI::ChatUI() {
     ftxui::InputOption user_option;
     user_option.multiline = false;
+    user_option.transform = [](ftxui::InputState state) {
+        if (state.focused) {
+            return state.element | ftxui::color(ftxui::Color::Cyan);
+        }
+        if (state.is_placeholder) {
+            return state.element | ftxui::color(ftxui::Color::GrayDark);
+        }
+        return state.element;
+    };
     login_username_input_ = ftxui::Input(&auth_username_, "Username", user_option);
 
     ftxui::InputOption pass_option;
     pass_option.multiline = false;
     pass_option.password = true;
+    pass_option.transform = user_option.transform;
     login_password_input_ = ftxui::Input(&auth_password_, "Password", pass_option);
 
-    login_btn_ = ftxui::Button("Submit", [this] {
-        PerformAuth(auth_state_ == AuthState::Register);
-    });
+    auto primary_button = ftxui::ButtonOption::Simple();
+    primary_button.transform = [](const ftxui::EntryState& state) {
+        auto label = ftxui::text(state.label) | ftxui::bold;
+        auto element = ftxui::hbox({
+            ftxui::filler(),
+            label,
+            ftxui::filler(),
+        });
+        if (state.focused) {
+            element = element |
+                ftxui::color(ftxui::Color::Black) |
+                ftxui::bgcolor(ftxui::Color::Cyan);
+        } else {
+            element = element | ftxui::color(ftxui::Color::Cyan);
+        }
+        return element | ftxui::borderRounded | ftxui::flex;
+    };
+    login_btn_ = ftxui::Button(
+        &auth_action_label_,
+        [this] { PerformAuth(auth_state_ == AuthState::Register); },
+        primary_button
+    );
 
-    switch_btn_ = ftxui::Button("Switch Mode", [this] {
+    auto secondary_button = ftxui::ButtonOption::Simple();
+    secondary_button.transform = [](const ftxui::EntryState& state) {
+        auto element = ftxui::text(state.label) | ftxui::center;
+        if (state.focused) {
+            return element | ftxui::bold | ftxui::color(ftxui::Color::Cyan);
+        }
+        return element | ftxui::color(ftxui::Color::GrayDark);
+    };
+    switch_btn_ = ftxui::Button(&auth_switch_label_, [this] {
         auth_state_ = (auth_state_ == AuthState::Login) ? AuthState::Register : AuthState::Login;
+        const bool is_login = auth_state_ == AuthState::Login;
+        auth_action_label_ = is_login ? "SIGN IN" : "CREATE ACCOUNT";
+        auth_switch_label_ = is_login
+            ? "New here? Create an account"
+            : "Already registered? Sign in";
         auth_error_.clear();
-    });
+    }, secondary_button);
 
     login_container_ = ftxui::Container::Vertical({
         login_username_input_,
@@ -417,23 +459,45 @@ ftxui::Component ChatUI::GetComponent() {
         using namespace ftxui;
 
         if (auth_state_ != AuthState::LoggedIn) {
-            Elements elements = Elements{
-                text("=== cim - Command Instant Messenger ===") | bold | color(Color::Cyan) | center,
-                separator(),
-                text(auth_state_ == AuthState::Login ? "Please Login" : "Please Register") | bold | center,
-                separator(),
-                hbox(Elements{text(" Username: "), login_username_input_->Render()}) | border,
-                hbox(Elements{text(" Password: "), login_password_input_->Render()}) | border,
-            };
+            const bool is_login = auth_state_ == AuthState::Login;
+            auto username_field = vbox(Elements{
+                text("USERNAME") | color(Color::GrayDark),
+                hbox(Elements{
+                    text(" > ") | bold | color(Color::Cyan),
+                    login_username_input_->Render() | flex,
+                }) | borderLight,
+            });
+            auto password_field = vbox(Elements{
+                text("PASSWORD") | color(Color::GrayDark),
+                hbox(Elements{
+                    text(" > ") | bold | color(Color::Cyan),
+                    login_password_input_->Render() | flex,
+                }) | borderLight,
+            });
+            auto status = auth_error_.empty()
+                ? text(" ")
+                : text("! " + auth_error_) | bold | color(Color::RedLight);
 
-            if (!auth_error_.empty()) {
-                elements.push_back(text(auth_error_) | color(Color::Red) | bold | center);
-            }
+            auto card = vbox(Elements{
+                text("cim") | bold | color(Color::Cyan) | center,
+                text("COMMAND INSTANT MESSENGER") | color(Color::GrayDark) | center,
+                text(" "),
+                text(is_login ? " SIGN IN " : " CREATE ACCOUNT ") |
+                    bold |
+                    color(Color::Black) |
+                    bgcolor(Color::Cyan) |
+                    center,
+                text(" "),
+                username_field,
+                text(" "),
+                password_field,
+                status | center,
+                login_btn_->Render() | size(WIDTH, EQUAL, 44) | hcenter,
+                text(" "),
+                switch_btn_->Render() | center,
+            }) | size(WIDTH, EQUAL, 50) | borderRounded;
 
-            elements.push_back(separator());
-            elements.push_back(hbox(Elements{login_btn_->Render(), text("   "), switch_btn_->Render()}) | center);
-
-            return vbox(elements) | border | center;
+            return card | center;
         }
 
         RefreshContacts();
