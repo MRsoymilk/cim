@@ -10,8 +10,14 @@
 #include <random>
 #include <sstream>
 #include <iomanip>
+#include <utility>
 
 using json = nlohmann::json;
+
+struct PerSocketData {
+    int64_t user_id;
+    std::string username;
+};
 
 std::string generateToken() {
     unsigned char buf[32];
@@ -45,7 +51,91 @@ int main() {
     // online_users: username -> last_heartbeat_timestamp
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> online_users;
 
-    uWS::App().post("/auth/register", [&db](auto* res, auto* req) {
+    uWS::App app;
+    app.ws<PerSocketData>("/ws", {
+        .compression = uWS::DISABLED,
+        .maxPayloadLength = 16 * 1024,
+        .idleTimeout = 60,
+        .upgrade = [&db](auto* res, auto* req, auto* context) {
+            std::string token = getAuthToken(req->getHeader("authorization"));
+            int64_t user_id = -1;
+            std::string username;
+            if (token.empty() || !db.getUserByToken(token, user_id, username)) {
+                res->writeStatus("401 Unauthorized")->end("Unauthorized");
+                return;
+            }
+
+            res->template upgrade<PerSocketData>(
+                {user_id, std::move(username)},
+                req->getHeader("sec-websocket-key"),
+                req->getHeader("sec-websocket-protocol"),
+                req->getHeader("sec-websocket-extensions"),
+                context
+            );
+        },
+        .open = [](auto* ws) {
+            const auto* user = ws->getUserData();
+            ws->subscribe("user:" + std::to_string(user->user_id));
+            std::cout << "[WebSocket] Connected: " << user->username
+                      << " (ID: " << user->user_id << ")" << std::endl;
+        },
+        .message = [&db](auto* ws, std::string_view message, uWS::OpCode op_code) {
+            auto send_error = [ws](std::string_view error) {
+                json response = {{"type", "error"}, {"error", error}};
+                ws->send(response.dump(), uWS::OpCode::TEXT);
+            };
+
+            if (op_code != uWS::OpCode::TEXT) {
+                send_error("Only text messages are supported");
+                return;
+            }
+
+            try {
+                auto request = json::parse(message);
+                if (request.value("type", "") != "chat") {
+                    send_error("Unsupported message type");
+                    return;
+                }
+
+                int64_t recipient_id = request.value("recipient_id", int64_t{-1});
+                std::string content = request.value("content", "");
+                std::string recipient_name;
+                if (recipient_id < 0 || !db.getUserById(recipient_id, recipient_name)) {
+                    send_error("Recipient not found");
+                    return;
+                }
+                if (content.empty() || content.size() > 4096) {
+                    send_error("Message must contain between 1 and 4096 bytes");
+                    return;
+                }
+
+                const auto* sender = ws->getUserData();
+                json response = {
+                    {"type", "chat"},
+                    {"sender_id", sender->user_id},
+                    {"sender_name", sender->username},
+                    {"recipient_id", recipient_id},
+                    {"recipient_name", recipient_name},
+                    {"content", content},
+                };
+                std::string payload = response.dump();
+
+                // A socket does not receive its own publications, so acknowledge it directly.
+                ws->send(payload, uWS::OpCode::TEXT);
+                ws->publish("user:" + std::to_string(sender->user_id), payload, uWS::OpCode::TEXT);
+                if (recipient_id != sender->user_id) {
+                    ws->publish("user:" + std::to_string(recipient_id), payload, uWS::OpCode::TEXT);
+                }
+            } catch (const json::exception&) {
+                send_error("Invalid message JSON");
+            }
+        },
+        .close = [](auto* ws, int, std::string_view) {
+            const auto* user = ws->getUserData();
+            std::cout << "[WebSocket] Disconnected: " << user->username
+                      << " (ID: " << user->user_id << ")" << std::endl;
+        },
+    }).post("/auth/register", [&db](auto* res, auto* req) {
         std::string* buffer = new std::string();
         res->onData([res, buffer, &db](std::string_view chunk, bool last) {
             buffer->append(chunk.data(), chunk.length());

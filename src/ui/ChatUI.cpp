@@ -2,9 +2,13 @@
 #include "ftxui/dom/elements.hpp"
 #include "ftxui/component/event.hpp"
 #include "ftxui/component/component.hpp"
+#include <ixwebsocket/IXNetSystem.h>
+#include <ixwebsocket/IXWebSocket.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <iterator>
+#include <utility>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -221,7 +225,11 @@ inline std::vector<Contact> fetchOnlineUsersWithAuth(const std::string& token, c
     return contacts;
 }
 
-ChatUI::ChatUI() {
+ChatUI::ChatUI(ftxui::Closure request_refresh)
+    : request_refresh_(std::move(request_refresh)) {
+    ix::initNetSystem();
+    websocket_ = std::make_unique<ix::WebSocket>();
+
     ftxui::InputOption user_option;
     user_option.multiline = false;
     user_option.transform = [](ftxui::InputState state) {
@@ -369,9 +377,15 @@ ChatUI::ChatUI() {
 }
 
 ChatUI::~ChatUI() {
+    heartbeat_thread_.request_stop();
+    if (websocket_) {
+        websocket_->stop();
+        websocket_.reset();
+    }
     if (auth_state_ == AuthState::LoggedIn && !auth_token_.empty()) {
         sendAuthenticatedPost("/leave", auth_token_);
     }
+    ix::uninitNetSystem();
 }
 
 bool ChatUI::PerformAuth(bool is_register) {
@@ -392,6 +406,7 @@ bool ChatUI::PerformAuth(bool is_register) {
         auth_error_.clear();
 
         sendAuthenticatedPost("/join", auth_token_);
+        ConnectWebSocket();
 
         heartbeat_thread_ = std::jthread([this](std::stop_token st) {
             while (!st.stop_requested()) {
@@ -409,6 +424,95 @@ bool ChatUI::PerformAuth(bool is_register) {
         auth_error_ = err;
         return false;
     }
+}
+
+void ChatUI::ConnectWebSocket() {
+    websocket_->setUrl("ws://127.0.0.1:9001/ws");
+    websocket_->setPingInterval(30);
+    websocket_->setExtraHeaders({{"Authorization", "Bearer " + auth_token_}});
+    websocket_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& message) {
+        SocketEvent event;
+        switch (message->type) {
+            case ix::WebSocketMessageType::Open:
+                websocket_connected_ = true;
+                event.type = SocketEventType::Connected;
+                break;
+            case ix::WebSocketMessageType::Close:
+                websocket_connected_ = false;
+                event.type = SocketEventType::Disconnected;
+                event.content = message->closeInfo.reason;
+                break;
+            case ix::WebSocketMessageType::Error:
+                websocket_connected_ = false;
+                event.type = SocketEventType::Error;
+                event.content = message->errorInfo.reason;
+                break;
+            case ix::WebSocketMessageType::Message:
+                try {
+                    auto payload = nlohmann::json::parse(message->str);
+                    if (payload.value("type", "") == "chat") {
+                        event.type = SocketEventType::Chat;
+                        event.sender_id = payload.value("sender_id", int64_t{-1});
+                        event.sender_name = payload.value("sender_name", "");
+                        event.recipient_id = payload.value("recipient_id", int64_t{-1});
+                        event.recipient_name = payload.value("recipient_name", "");
+                        event.content = payload.value("content", "");
+                    } else {
+                        event.type = SocketEventType::Error;
+                        event.content = payload.value("error", "Unsupported server message");
+                    }
+                } catch (const nlohmann::json::exception&) {
+                    event.type = SocketEventType::Error;
+                    event.content = "Invalid WebSocket response";
+                }
+                break;
+            default:
+                return;
+        }
+
+        {
+            std::lock_guard lock(socket_events_mutex_);
+            socket_events_.push_back(std::move(event));
+        }
+        request_refresh_();
+    });
+    websocket_->start();
+}
+
+void ChatUI::DrainSocketEvents() {
+    std::deque<SocketEvent> events;
+    {
+        std::lock_guard lock(socket_events_mutex_);
+        events.swap(socket_events_);
+    }
+
+    for (auto& event : events) {
+        if (event.type == SocketEventType::Connected) {
+            notification_.clear();
+            continue;
+        }
+        if (event.type == SocketEventType::Disconnected) {
+            notification_ = "WebSocket disconnected";
+            continue;
+        }
+        if (event.type == SocketEventType::Error) {
+            notification_ = "WebSocket: " + event.content;
+            continue;
+        }
+
+        const bool is_me = event.sender_id == my_user_id_;
+        const int64_t contact_id = is_me ? event.recipient_id : event.sender_id;
+        const std::string& contact_name = is_me ? event.recipient_name : event.sender_name;
+        auto contact = std::find_if(contacts_.begin(), contacts_.end(), [contact_id](const Contact& item) {
+            return item.id == contact_id;
+        });
+        if (contact == contacts_.end()) {
+            contacts_.push_back({contact_id, contact_name, true, {}});
+            contact = std::prev(contacts_.end());
+        }
+        contact->messages.push_back({is_me, std::move(event.content)});
+    }
+    UpdateFilteredContacts();
 }
 
 void ChatUI::RefreshContacts() {
@@ -446,10 +550,21 @@ void ChatUI::SendMessage() {
         chat_input_text_.erase(std::remove(chat_input_text_.begin(), chat_input_text_.end(), '\n'), chat_input_text_.end());
         if (chat_input_text_.empty()) {
             notification_ = "Warning: Cannot send empty message!";
+        } else if (!websocket_connected_) {
+            notification_ = "WebSocket is not connected";
         } else {
-            notification_.clear();
-            contacts_[actual_idx].messages.push_back({true, chat_input_text_});
-            chat_input_text_.clear();
+            nlohmann::json message = {
+                {"type", "chat"},
+                {"recipient_id", contacts_[actual_idx].id},
+                {"content", chat_input_text_},
+            };
+            auto result = websocket_->send(message.dump());
+            if (result.success) {
+                notification_.clear();
+                chat_input_text_.clear();
+            } else {
+                notification_ = "Failed to send WebSocket message";
+            }
         }
     }
 }
@@ -578,6 +693,10 @@ ftxui::Component ChatUI::GetComponent() {
             right_pane,
         });
     }) | ftxui::CatchEvent([this](ftxui::Event event) {
+        if (event == ftxui::Event::Custom) {
+            DrainSocketEvents();
+            return true;
+        }
         if (auth_state_ != AuthState::LoggedIn) return false;
         if (editing_name_ ) {
             return false;

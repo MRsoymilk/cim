@@ -10,3 +10,6 @@
 [submodule "vendor/libsodium"]
 	path = vendor/libsodium
 	url = https://github.com/jedisct1/libsodium.git
+[submodule "vendor/IXWebSocket"]
+	path = vendor/IXWebSocket
+	url = https://github.com/machinezone/IXWebSocket.git

@@ -1,10 +1,19 @@
 #pragma once
 
 #include "ftxui/component/component.hpp"
+#include "ftxui/component/task.hpp"
+#include <atomic>
 #include <string>
 #include <vector>
 #include <thread>
 #include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
+
+namespace ix {
+class WebSocket;
+}
 
 namespace cim {
 
@@ -23,11 +32,28 @@ enum class AuthState {
 
 class ChatUI {
 public:
-    ChatUI();
+    explicit ChatUI(ftxui::Closure request_refresh);
     ~ChatUI();
     ftxui::Component GetComponent();
 
 private:
+    enum class SocketEventType {
+        Connected,
+        Disconnected,
+        Chat,
+        Error
+    };
+
+    struct SocketEvent {
+        SocketEventType type;
+        int64_t sender_id = -1;
+        std::string sender_name;
+        int64_t recipient_id = -1;
+        std::string recipient_name;
+        std::string content;
+    };
+
+    ftxui::Closure request_refresh_;
     AuthState auth_state_ = AuthState::Login;
     std::string auth_username_ = "";
     std::string auth_password_ = "";
@@ -70,8 +96,14 @@ private:
     std::vector<std::string> filtered_names_;
 
     std::jthread heartbeat_thread_;
+    std::unique_ptr<ix::WebSocket> websocket_;
+    std::atomic<bool> websocket_connected_ = false;
+    std::mutex socket_events_mutex_;
+    std::deque<SocketEvent> socket_events_;
 
     bool PerformAuth(bool is_register);
+    void ConnectWebSocket();
+    void DrainSocketEvents();
     void UpdateFilteredContacts();
     void SendMessage();
     void RefreshContacts();
