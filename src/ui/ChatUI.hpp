@@ -16,11 +16,17 @@ class WebSocket;
 
 namespace cim {
 
+struct ChatMessage {
+    bool is_me;
+    std::string content;
+    int64_t sent_at;
+};
+
 struct Contact {
     int64_t id;
     std::string name;
     bool online;
-    std::vector<std::pair<bool, std::string>> messages;
+    std::vector<ChatMessage> messages;
 };
 
 enum class AuthState {

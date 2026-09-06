@@ -245,6 +245,7 @@ int main() {
                     {"recipient_id", recipient_id},
                     {"recipient_name", recipient_name},
                     {"content", content},
+                    {"sent_at", static_cast<int64_t>(std::time(nullptr))},
                 }.dump();
                 for (const auto& [client, session] : authenticatedClients()) {
                     if (session.user_id == sender.user_id || session.user_id == recipient_id) {

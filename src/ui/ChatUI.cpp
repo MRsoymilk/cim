@@ -6,10 +6,38 @@
 #include <ixwebsocket/IXWebSocket.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <ctime>
+#include <iomanip>
 #include <iterator>
+#include <sstream>
 #include <utility>
 
 namespace cim {
+
+namespace {
+
+std::string FormatTimestamp(int64_t timestamp) {
+    if (timestamp <= 0) {
+        return "Unknown time";
+    }
+    std::time_t time = static_cast<std::time_t>(timestamp);
+    std::tm local_time{};
+#ifdef _WIN32
+    if (localtime_s(&local_time, &time) != 0) {
+        return "Unknown time";
+    }
+#else
+    if (localtime_r(&time, &local_time) == nullptr) {
+        return "Unknown time";
+    }
+#endif
+
+    std::ostringstream output;
+    output << std::put_time(&local_time, "%Y-%m-%d %H:%M");
+    return output.str();
+}
+
+} // namespace
 
 ChatUI::ChatUI(ftxui::Closure request_refresh)
     : request_refresh_(std::move(request_refresh)) {
@@ -340,7 +368,11 @@ void ChatUI::DrainSocketEvents() {
                 contacts_.push_back({contact_id, contact_name, true, {}});
                 contact = std::prev(contacts_.end());
             }
-            contact->messages.push_back({is_me, payload.value("content", "")});
+            contact->messages.push_back({
+                is_me,
+                payload.value("content", ""),
+                payload.value("sent_at", int64_t{0}),
+            });
         }
     }
     UpdateFilteredContacts();
@@ -465,16 +497,24 @@ ftxui::Component ChatUI::GetComponent() {
             if (contact.messages.empty()) {
                 msg_elements.push_back(text("No messages yet with " + contact.name) | dim | italic);
             } else {
-                for (const auto& [is_me, msg] : contact.messages) {
-                    if (is_me) {
-                        msg_elements.push_back(hbox(Elements{
-                            filler(),
-                            text(my_name_ + ": " + msg) | color(Color::Green)
+                for (const auto& message : contact.messages) {
+                    auto timestamp = text(FormatTimestamp(message.sent_at)) |
+                        color(Color::GrayDark);
+                    if (message.is_me) {
+                        msg_elements.push_back(vbox(Elements{
+                            hbox(Elements{filler(), timestamp}),
+                            hbox(Elements{
+                                filler(),
+                                text(my_name_ + ": " + message.content) | color(Color::Green),
+                            }),
                         }));
                     } else {
-                        msg_elements.push_back(hbox(Elements{
-                            text(contact.name + ": " + msg) | color(Color::Cyan),
-                            filler()
+                        msg_elements.push_back(vbox(Elements{
+                            hbox(Elements{timestamp, filler()}),
+                            hbox(Elements{
+                                text(contact.name + ": " + message.content) | color(Color::Cyan),
+                                filler(),
+                            }),
                         }));
                     }
                 }
