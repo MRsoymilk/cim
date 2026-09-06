@@ -28,7 +28,7 @@ else()
     set(CIM_SODIUM_TARGET cim-sodium)
 endif()
 
-add_executable(cim-server main.cpp Database.cpp)
+add_executable(cim-server main.cpp Database.cpp AdminCLI.cpp)
 target_include_directories(cim-server PRIVATE
     ${CMAKE_SOURCE_DIR}/vendor/nlohmann_json/single_include
 )

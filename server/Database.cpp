@@ -24,6 +24,7 @@ bool Database::execute(const std::string& sql) {
 }
 
 bool Database::init(const std::string& db_path) {
+    std::lock_guard lock(mutex_);
     int rc = sqlite3_open(db_path.c_str(), &db_);
     if (rc != SQLITE_OK) {
         std::cerr << "[Database] Cannot open database: " << sqlite3_errmsg(db_) << std::endl;
@@ -56,6 +57,7 @@ bool Database::init(const std::string& db_path) {
 }
 
 int64_t Database::registerUser(const std::string& username, const std::string& password_hash) {
+    std::lock_guard lock(mutex_);
     std::string sql = "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?);";
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
@@ -77,6 +79,7 @@ int64_t Database::registerUser(const std::string& username, const std::string& p
 }
 
 bool Database::getUser(const std::string& username, int64_t& id_out, std::string& password_hash_out) {
+    std::lock_guard lock(mutex_);
     std::string sql = "SELECT id, password_hash FROM users WHERE username = ?;";
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
@@ -98,6 +101,7 @@ bool Database::getUser(const std::string& username, int64_t& id_out, std::string
 }
 
 bool Database::getUserById(int64_t id, std::string& username_out) {
+    std::lock_guard lock(mutex_);
     std::string sql = "SELECT username FROM users WHERE id = ?;";
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr);
@@ -118,6 +122,7 @@ bool Database::getUserById(int64_t id, std::string& username_out) {
 }
 
 std::vector<std::pair<int64_t, std::string>> Database::getAllUsers() {
+    std::lock_guard lock(mutex_);
     std::vector<std::pair<int64_t, std::string>> users;
     std::string sql = "SELECT id, username FROM users;";
     sqlite3_stmt* stmt = nullptr;
@@ -136,7 +141,123 @@ std::vector<std::pair<int64_t, std::string>> Database::getAllUsers() {
     return users;
 }
 
+std::vector<UserRecord> Database::getUserRecords() {
+    std::lock_guard lock(mutex_);
+    std::vector<UserRecord> users;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db_, "SELECT id, username, created_at FROM users ORDER BY id;", -1, &stmt, nullptr) != SQLITE_OK) {
+        return users;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* username = sqlite3_column_text(stmt, 1);
+        if (username) {
+            users.push_back({
+                sqlite3_column_int64(stmt, 0),
+                reinterpret_cast<const char*>(username),
+                sqlite3_column_int64(stmt, 2),
+            });
+        }
+    }
+    sqlite3_finalize(stmt);
+    return users;
+}
+
+bool Database::changePassword(const std::string& username,
+                              const std::string& password_hash,
+                              int64_t& user_id_out) {
+    std::lock_guard lock(mutex_);
+    sqlite3_stmt* user_stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db_, "SELECT id FROM users WHERE username = ?;", -1, &user_stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(user_stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(user_stmt) != SQLITE_ROW) {
+        sqlite3_finalize(user_stmt);
+        return false;
+    }
+    user_id_out = sqlite3_column_int64(user_stmt, 0);
+    sqlite3_finalize(user_stmt);
+
+    if (!execute("BEGIN IMMEDIATE;")) {
+        return false;
+    }
+    sqlite3_stmt* update_stmt = nullptr;
+    bool success = sqlite3_prepare_v2(
+        db_, "UPDATE users SET password_hash = ? WHERE id = ?;", -1, &update_stmt, nullptr) == SQLITE_OK;
+    if (success) {
+        sqlite3_bind_text(update_stmt, 1, password_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(update_stmt, 2, user_id_out);
+        success = sqlite3_step(update_stmt) == SQLITE_DONE;
+    }
+    sqlite3_finalize(update_stmt);
+
+    sqlite3_stmt* sessions_stmt = nullptr;
+    if (success) {
+        success = sqlite3_prepare_v2(
+            db_, "DELETE FROM sessions WHERE user_id = ?;", -1, &sessions_stmt, nullptr) == SQLITE_OK;
+    }
+    if (success) {
+        sqlite3_bind_int64(sessions_stmt, 1, user_id_out);
+        success = sqlite3_step(sessions_stmt) == SQLITE_DONE;
+    }
+    sqlite3_finalize(sessions_stmt);
+    if (success) {
+        success = execute("COMMIT;");
+    } else {
+        execute("ROLLBACK;");
+    }
+    return success;
+}
+
+bool Database::deleteUser(const std::string& username, int64_t& user_id_out) {
+    std::lock_guard lock(mutex_);
+    sqlite3_stmt* user_stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db_, "SELECT id FROM users WHERE username = ?;", -1, &user_stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(user_stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(user_stmt) != SQLITE_ROW) {
+        sqlite3_finalize(user_stmt);
+        return false;
+    }
+    user_id_out = sqlite3_column_int64(user_stmt, 0);
+    sqlite3_finalize(user_stmt);
+
+    if (!execute("BEGIN IMMEDIATE;")) {
+        return false;
+    }
+    sqlite3_stmt* sessions_stmt = nullptr;
+    bool success = sqlite3_prepare_v2(
+        db_, "DELETE FROM sessions WHERE user_id = ?;", -1, &sessions_stmt, nullptr) == SQLITE_OK;
+    if (success) {
+        sqlite3_bind_int64(sessions_stmt, 1, user_id_out);
+        success = sqlite3_step(sessions_stmt) == SQLITE_DONE;
+    }
+    sqlite3_finalize(sessions_stmt);
+
+    sqlite3_stmt* delete_stmt = nullptr;
+    if (success) {
+        success = sqlite3_prepare_v2(
+            db_, "DELETE FROM users WHERE id = ?;", -1, &delete_stmt, nullptr) == SQLITE_OK;
+    }
+    if (success) {
+        sqlite3_bind_int64(delete_stmt, 1, user_id_out);
+        success = sqlite3_step(delete_stmt) == SQLITE_DONE;
+    }
+    sqlite3_finalize(delete_stmt);
+    if (success) {
+        success = execute("COMMIT;");
+    } else {
+        execute("ROLLBACK;");
+    }
+    return success;
+}
+
 bool Database::createSession(const std::string& token, int64_t user_id, int64_t expires_at) {
+    std::lock_guard lock(mutex_);
     std::string sql = "INSERT OR REPLACE INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?);";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
@@ -151,6 +272,7 @@ bool Database::createSession(const std::string& token, int64_t user_id, int64_t 
 }
 
 bool Database::getUserByToken(const std::string& token, int64_t& user_id_out, std::string& username_out) {
+    std::lock_guard lock(mutex_);
     std::string sql = "SELECT s.user_id, u.username FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.token = ? AND s.expires_at > ?;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) return false;
@@ -172,6 +294,7 @@ bool Database::getUserByToken(const std::string& token, int64_t& user_id_out, st
 }
 
 void Database::deleteSession(const std::string& token) {
+    std::lock_guard lock(mutex_);
     std::string sql = "DELETE FROM sessions WHERE token = ?;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
@@ -182,6 +305,7 @@ void Database::deleteSession(const std::string& token) {
 }
 
 void Database::cleanupExpiredSessions() {
+    std::lock_guard lock(mutex_);
     std::string sql = "DELETE FROM sessions WHERE expires_at <= ?;";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {

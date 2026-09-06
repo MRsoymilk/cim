@@ -1,2 +1,5 @@
 .qtcreator
 build
+cim-admin.key
+cim-config.json
+cim.db
