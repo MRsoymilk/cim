@@ -6,7 +6,10 @@
 #include <nlohmann/json.hpp>
 #include <sodium.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdint>
+#include <chrono>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
@@ -37,6 +40,15 @@ std::string GenerateToken() {
     return stream.str();
 }
 
+bool IsValidUsername(const std::string& username) {
+    if (username.size() < 3 || username.size() > 32) {
+        return false;
+    }
+    return std::all_of(username.begin(), username.end(), [](unsigned char character) {
+        return std::isalnum(character) || character == '_' || character == '-' || character == '.';
+    });
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -63,6 +75,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     db.cleanupExpiredSessions();
+    db.cleanupExpiredRegistrationRequests();
 
     std::string admin_key_error;
     std::string admin_key = cim::LoadAdminKey("cim-admin.key", true, admin_key_error);
@@ -79,6 +92,8 @@ int main(int argc, char** argv) {
 
     std::mutex sessions_mutex;
     std::unordered_map<ix::WebSocket*, Session> sessions;
+    std::mutex registration_attempts_mutex;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> registration_attempts;
 
     auto authenticatedClients = [&] {
         std::vector<std::pair<std::shared_ptr<ix::WebSocket>, Session>> clients;
@@ -133,7 +148,7 @@ int main(int argc, char** argv) {
     };
 
     server.setOnClientMessageCallback(
-        [&](std::shared_ptr<ix::ConnectionState>,
+        [&](std::shared_ptr<ix::ConnectionState> connection_state,
             ix::WebSocket& socket,
             const ix::WebSocketMessagePtr& message) {
             if (message->type == ix::WebSocketMessageType::Open) {
@@ -178,6 +193,42 @@ int main(int argc, char** argv) {
 
                     int64_t user_id = -1;
                     if (type == "register") {
+                        if (!IsValidUsername(username)) {
+                            sendError("Username must be 3-32 characters using letters, numbers, '.', '_' or '-'");
+                            return;
+                        }
+                        if (password.size() > 256) {
+                            sendError("Password must not exceed 256 characters");
+                            return;
+                        }
+                        const auto now = std::chrono::steady_clock::now();
+                        {
+                            std::lock_guard lock(registration_attempts_mutex);
+                            for (auto attempt = registration_attempts.begin();
+                                 attempt != registration_attempts.end();) {
+                                if (now - attempt->second >= std::chrono::hours(1)) {
+                                    attempt = registration_attempts.erase(attempt);
+                                } else {
+                                    ++attempt;
+                                }
+                            }
+                            auto previous = registration_attempts.find(connection_state->getRemoteIp());
+                            if (previous != registration_attempts.end() &&
+                                now - previous->second < std::chrono::seconds(3)) {
+                                sendError("Please wait before submitting another registration request");
+                                return;
+                            }
+                            registration_attempts.insert_or_assign(connection_state->getRemoteIp(), now);
+                        }
+                        std::string existing_password_hash;
+                        if (db.getUser(username, user_id, existing_password_hash)) {
+                            sendError("Username already exists");
+                            return;
+                        }
+                        if (db.isRegistrationPending(username)) {
+                            sendError("Registration request is already awaiting approval");
+                            return;
+                        }
                         char password_hash[crypto_pwhash_STRBYTES];
                         if (crypto_pwhash_str(
                                 password_hash,
@@ -188,15 +239,40 @@ int main(int argc, char** argv) {
                             sendError("Password hashing failed");
                             return;
                         }
-                        user_id = db.registerUser(username, password_hash);
-                        if (user_id < 0) {
+                        const auto registration = db.submitRegistration(username, password_hash);
+                        if (registration == cim::RegistrationRequestResult::UsernameExists) {
                             sendError("Username already exists");
                             return;
                         }
+                        if (registration == cim::RegistrationRequestResult::AlreadyPending) {
+                            sendError("Registration request is already awaiting approval");
+                            return;
+                        }
+                        if (registration == cim::RegistrationRequestResult::QueueFull) {
+                            sendError("Registration queue is full; contact the administrator");
+                            return;
+                        }
+                        if (registration != cim::RegistrationRequestResult::Submitted) {
+                            sendError("Unable to submit registration request");
+                            return;
+                        }
+                        socket.send(json{
+                            {"type", "registration_pending"},
+                            {"message", "Registration submitted; wait for administrator approval, then sign in"},
+                        }.dump());
+                        std::cout << "[Server] Registration awaiting approval: " << username << std::endl;
+                        return;
                     } else {
                         std::string password_hash;
-                        if (!db.getUser(username, user_id, password_hash) ||
-                            crypto_pwhash_str_verify(
+                        if (!db.getUser(username, user_id, password_hash)) {
+                            if (db.isRegistrationPending(username)) {
+                                sendError("Registration is awaiting administrator approval");
+                            } else {
+                                sendError("Invalid username or password");
+                            }
+                            return;
+                        }
+                        if (crypto_pwhash_str_verify(
                                 password_hash.c_str(), password.c_str(), password.size()) != 0) {
                             sendError("Invalid username or password");
                             return;
@@ -307,18 +383,40 @@ int main(int argc, char** argv) {
                 socket.send(json{{"success", false}, {"error", error}}.dump());
             };
             auto request = json::parse(message->str, nullptr, false);
-            if (request.is_discarded()) {
+            if (request.is_discarded() || !request.is_object() ||
+                !request.contains("token") || !request["token"].is_string() ||
+                !request.contains("command") || !request["command"].is_string()) {
                 sendError("Invalid administrator request");
                 return;
             }
-            std::string supplied_key = request.value("token", "");
+            std::string supplied_key = request["token"].get<std::string>();
             if (supplied_key.size() != admin_key.size() ||
                 sodium_memcmp(supplied_key.data(), admin_key.data(), admin_key.size()) != 0) {
                 sendError("Administrator authentication failed");
                 return;
             }
 
-            std::string command = request.value("command", "");
+            std::string command = request["command"].get<std::string>();
+            if (command == "pending") {
+                std::vector<cim::RegistrationRequest> registrations;
+                if (!db.getRegistrationRequests(registrations)) {
+                    sendError("Unable to list registration requests");
+                    return;
+                }
+                json requests = json::array();
+                for (const auto& registration : registrations) {
+                    requests.push_back({
+                        {"username", registration.username},
+                        {"requested_at", registration.requested_at},
+                    });
+                }
+                socket.send(json{
+                    {"success", true},
+                    {"command", "pending"},
+                    {"requests", requests},
+                }.dump());
+                return;
+            }
             if (command == "users") {
                 std::unordered_set<int64_t> online_ids;
                 for (const auto& [client, session] : authenticatedClients()) {
@@ -341,17 +439,46 @@ int main(int argc, char** argv) {
                 return;
             }
 
-            std::string username = request.value("username", "");
+            if (!request.contains("username") || !request["username"].is_string()) {
+                sendError("Username is required");
+                return;
+            }
+            std::string username = request["username"].get<std::string>();
             if (username.empty()) {
                 sendError("Username is required");
                 return;
             }
+            if (command == "approve") {
+                int64_t user_id = -1;
+                if (!db.approveRegistration(username, user_id)) {
+                    sendError("Registration request not found or approval failed");
+                    return;
+                }
+                broadcastUsers();
+                socket.send(json{
+                    {"success", true},
+                    {"message", "Registration approved"},
+                }.dump());
+                return;
+            }
+            if (command == "reject") {
+                if (!db.rejectRegistration(username)) {
+                    sendError("Registration request not found or rejection failed");
+                    return;
+                }
+                socket.send(json{
+                    {"success", true},
+                    {"message", "Registration rejected"},
+                }.dump());
+                return;
+            }
             if (command == "passwd") {
-                std::string password = request.value("password", "");
-                if (password.empty()) {
+                if (!request.contains("password") || !request["password"].is_string() ||
+                    request["password"].get_ref<const std::string&>().empty()) {
                     sendError("Password cannot be empty");
                     return;
                 }
+                std::string password = request["password"].get<std::string>();
                 char password_hash[crypto_pwhash_STRBYTES];
                 if (crypto_pwhash_str(
                         password_hash,

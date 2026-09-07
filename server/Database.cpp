@@ -48,7 +48,15 @@ bool Database::init(const std::string& db_path) {
         "  FOREIGN KEY(user_id) REFERENCES users(id)"
         ");";
 
-    if (!execute(users_table) || !execute(sessions_table)) {
+    std::string registration_requests_table =
+        "CREATE TABLE IF NOT EXISTS registration_requests ("
+        "  username TEXT PRIMARY KEY COLLATE NOCASE,"
+        "  password_hash TEXT NOT NULL,"
+        "  requested_at INTEGER NOT NULL"
+        ");";
+
+    if (!execute(users_table) || !execute(sessions_table) ||
+        !execute(registration_requests_table)) {
         return false;
     }
 
@@ -205,6 +213,9 @@ bool Database::changePassword(const std::string& username,
     sqlite3_finalize(sessions_stmt);
     if (success) {
         success = execute("COMMIT;");
+        if (!success) {
+            execute("ROLLBACK;");
+        }
     } else {
         execute("ROLLBACK;");
     }
@@ -250,10 +261,252 @@ bool Database::deleteUser(const std::string& username, int64_t& user_id_out) {
     sqlite3_finalize(delete_stmt);
     if (success) {
         success = execute("COMMIT;");
+        if (!success) {
+            execute("ROLLBACK;");
+        }
     } else {
         execute("ROLLBACK;");
     }
     return success;
+}
+
+RegistrationRequestResult Database::submitRegistration(
+    const std::string& username,
+    const std::string& password_hash) {
+    std::lock_guard lock(mutex_);
+    sqlite3_stmt* stmt = nullptr;
+    bool success = sqlite3_prepare_v2(
+        db_, "DELETE FROM registration_requests WHERE requested_at <= ?;", -1, &stmt, nullptr) == SQLITE_OK;
+    if (success) {
+        sqlite3_bind_int64(stmt, 1, std::time(nullptr) - 86400 * 7);
+        success = sqlite3_step(stmt) == SQLITE_DONE;
+    }
+    sqlite3_finalize(stmt);
+    if (!success) {
+        return RegistrationRequestResult::Error;
+    }
+    if (!execute("BEGIN IMMEDIATE;")) {
+        return RegistrationRequestResult::Error;
+    }
+
+    stmt = nullptr;
+    success = sqlite3_prepare_v2(
+        db_, "SELECT COUNT(*) FROM registration_requests;", -1, &stmt, nullptr) == SQLITE_OK;
+    if (success) {
+        success = sqlite3_step(stmt) == SQLITE_ROW;
+    }
+    const bool queue_full = success && sqlite3_column_int64(stmt, 0) >= 1000;
+    sqlite3_finalize(stmt);
+    if (!success || queue_full) {
+        execute("ROLLBACK;");
+        return queue_full ? RegistrationRequestResult::QueueFull : RegistrationRequestResult::Error;
+    }
+
+    stmt = nullptr;
+    success = sqlite3_prepare_v2(
+        db_, "SELECT 1 FROM users WHERE username = ?;", -1, &stmt, nullptr) == SQLITE_OK;
+    if (success) {
+        sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+        const int step_result = sqlite3_step(stmt);
+        if (step_result == SQLITE_ROW) {
+            sqlite3_finalize(stmt);
+            execute("ROLLBACK;");
+            return RegistrationRequestResult::UsernameExists;
+        }
+        success = step_result == SQLITE_DONE;
+    }
+    sqlite3_finalize(stmt);
+    if (!success) {
+        execute("ROLLBACK;");
+        return RegistrationRequestResult::Error;
+    }
+
+    stmt = nullptr;
+    success = sqlite3_prepare_v2(
+        db_, "SELECT 1 FROM registration_requests WHERE username = ?;", -1, &stmt, nullptr) == SQLITE_OK;
+    if (success) {
+        sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+        const int step_result = sqlite3_step(stmt);
+        if (step_result == SQLITE_ROW) {
+            sqlite3_finalize(stmt);
+            execute("ROLLBACK;");
+            return RegistrationRequestResult::AlreadyPending;
+        }
+        success = step_result == SQLITE_DONE;
+    }
+    sqlite3_finalize(stmt);
+    if (!success) {
+        execute("ROLLBACK;");
+        return RegistrationRequestResult::Error;
+    }
+
+    stmt = nullptr;
+    success = sqlite3_prepare_v2(
+        db_,
+        "INSERT INTO registration_requests (username, password_hash, requested_at) VALUES (?, ?, ?);",
+        -1,
+        &stmt,
+        nullptr) == SQLITE_OK;
+    if (success) {
+        sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, password_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 3, std::time(nullptr));
+        success = sqlite3_step(stmt) == SQLITE_DONE;
+    }
+    sqlite3_finalize(stmt);
+    if (success) {
+        success = execute("COMMIT;");
+        if (!success) {
+            execute("ROLLBACK;");
+        }
+    } else {
+        execute("ROLLBACK;");
+    }
+    return success ? RegistrationRequestResult::Submitted : RegistrationRequestResult::Error;
+}
+
+bool Database::isRegistrationPending(const std::string& username) {
+    std::lock_guard lock(mutex_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT 1 FROM registration_requests WHERE username = ? AND requested_at > ?;",
+            -1,
+            &stmt,
+            nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, std::time(nullptr) - 86400 * 7);
+    const bool found = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+bool Database::getRegistrationRequests(std::vector<RegistrationRequest>& requests_out) {
+    std::lock_guard lock(mutex_);
+    requests_out.clear();
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT username, requested_at FROM registration_requests "
+            "WHERE requested_at > ? ORDER BY requested_at, username;",
+            -1,
+            &stmt,
+            nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_int64(stmt, 1, std::time(nullptr) - 86400 * 7);
+    int step_result = SQLITE_ROW;
+    while ((step_result = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const unsigned char* username = sqlite3_column_text(stmt, 0);
+        if (username) {
+            requests_out.push_back({
+                reinterpret_cast<const char*>(username),
+                sqlite3_column_int64(stmt, 1),
+            });
+        }
+    }
+    sqlite3_finalize(stmt);
+    return step_result == SQLITE_DONE;
+}
+
+bool Database::approveRegistration(const std::string& username, int64_t& user_id_out) {
+    std::lock_guard lock(mutex_);
+    if (!execute("BEGIN IMMEDIATE;")) {
+        return false;
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    bool success = sqlite3_prepare_v2(
+        db_,
+        "SELECT username, password_hash FROM registration_requests "
+        "WHERE username = ? AND requested_at > ?;",
+        -1,
+        &stmt,
+        nullptr) == SQLITE_OK;
+    std::string password_hash;
+    std::string requested_username;
+    if (success) {
+        sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, std::time(nullptr) - 86400 * 7);
+        success = sqlite3_step(stmt) == SQLITE_ROW;
+        if (success) {
+            const unsigned char* stored_username = sqlite3_column_text(stmt, 0);
+            const unsigned char* hash = sqlite3_column_text(stmt, 1);
+            success = stored_username != nullptr && hash != nullptr;
+            if (success) {
+                requested_username = reinterpret_cast<const char*>(stored_username);
+                password_hash = reinterpret_cast<const char*>(hash);
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    stmt = nullptr;
+    if (success) {
+        success = sqlite3_prepare_v2(
+            db_,
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?);",
+            -1,
+            &stmt,
+            nullptr) == SQLITE_OK;
+    }
+    if (success) {
+        sqlite3_bind_text(stmt, 1, requested_username.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, password_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 3, std::time(nullptr));
+        success = sqlite3_step(stmt) == SQLITE_DONE;
+        if (success) {
+            user_id_out = sqlite3_last_insert_rowid(db_);
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    stmt = nullptr;
+    if (success) {
+        success = sqlite3_prepare_v2(
+            db_, "DELETE FROM registration_requests WHERE username = ?;", -1, &stmt, nullptr) == SQLITE_OK;
+    }
+    if (success) {
+        sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+        success = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+    }
+    sqlite3_finalize(stmt);
+
+    if (success) {
+        success = execute("COMMIT;");
+        if (!success) {
+            execute("ROLLBACK;");
+        }
+    } else {
+        execute("ROLLBACK;");
+    }
+    return success;
+}
+
+bool Database::rejectRegistration(const std::string& username) {
+    std::lock_guard lock(mutex_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db_, "DELETE FROM registration_requests WHERE username = ?;", -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
+    const bool success = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+    sqlite3_finalize(stmt);
+    return success;
+}
+
+void Database::cleanupExpiredRegistrationRequests() {
+    std::lock_guard lock(mutex_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db_, "DELETE FROM registration_requests WHERE requested_at <= ?;", -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, std::time(nullptr) - 86400 * 7);
+        sqlite3_step(stmt);
+    }
+    sqlite3_finalize(stmt);
 }
 
 bool Database::createSession(const std::string& token, int64_t user_id, int64_t expires_at) {

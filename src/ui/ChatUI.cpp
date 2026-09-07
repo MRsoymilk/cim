@@ -116,6 +116,7 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
             ? "New here? Create an account"
             : "Already registered? Sign in";
         auth_error_.clear();
+        auth_notice_.clear();
     }, secondary_button);
 
     login_settings_btn_ = ftxui::Button("Server settings", [this] {
@@ -266,6 +267,7 @@ ChatUI::~ChatUI() {
 }
 
 bool ChatUI::PerformAuth(bool is_register) {
+    auth_notice_.clear();
     if (auth_username_.empty() || auth_password_.empty()) {
         auth_error_ = "Username and password cannot be empty";
         return false;
@@ -363,6 +365,7 @@ void ChatUI::ReconnectWebSocket() {
     selected_contact_index_ = 0;
     notification_.clear();
     auth_error_.clear();
+    auth_notice_.clear();
     auth_state_ = AuthState::Login;
     auth_action_label_ = "SIGN IN";
     auth_switch_label_ = "New here? Create an account";
@@ -461,8 +464,20 @@ void ChatUI::DrainSocketEvents() {
             if (auth_state_ == AuthState::LoggedIn) {
                 notification_ = error;
             } else {
+                auth_notice_.clear();
                 auth_error_ = error;
             }
+            continue;
+        }
+        if (type == "registration_pending") {
+            auth_state_ = AuthState::Login;
+            auth_action_label_ = "SIGN IN";
+            auth_switch_label_ = "New here? Create an account";
+            auth_password_.clear();
+            auth_error_.clear();
+            auth_notice_ = payload.value(
+                "message", "Registration submitted; wait for administrator approval, then sign in");
+            login_username_input_->TakeFocus();
             continue;
         }
         if (type == "auth_success") {
@@ -474,6 +489,7 @@ void ChatUI::DrainSocketEvents() {
             websocket_authenticated_ = true;
             active_tab_index_ = 1;
             auth_error_.clear();
+            auth_notice_.clear();
             notification_.clear();
             websocket_->send(nlohmann::json{{"type", "users"}}.dump());
             split_container_->TakeFocus();
@@ -664,9 +680,12 @@ ftxui::Component ChatUI::GetComponent() {
                     login_password_input_->Render() | flex,
                 }) | borderLight,
             });
-            auto status = auth_error_.empty()
-                ? text(" ")
-                : text("! " + auth_error_) | bold | color(Color::RedLight);
+            Element status = text(" ");
+            if (!auth_error_.empty()) {
+                status = text("! " + auth_error_) | bold | color(Color::RedLight);
+            } else if (!auth_notice_.empty()) {
+                status = text(auth_notice_) | bold | color(Color::GreenLight);
+            }
 
             auto card = vbox(Elements{
                 text("cim") | bold | color(Color::Cyan) | center,

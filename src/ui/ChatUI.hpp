@@ -61,6 +61,7 @@ private:
     std::string auth_username_ = "";
     std::string auth_password_ = "";
     std::string auth_error_ = "";
+    std::string auth_notice_ = "";
     std::string auth_token_ = "";
     std::string auth_action_label_ = "SIGN IN";
     std::string auth_switch_label_ = "New here? Create an account";

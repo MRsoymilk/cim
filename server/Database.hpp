@@ -16,6 +16,19 @@ struct UserRecord {
     int64_t created_at;
 };
 
+struct RegistrationRequest {
+    std::string username;
+    int64_t requested_at;
+};
+
+enum class RegistrationRequestResult {
+    Submitted,
+    UsernameExists,
+    AlreadyPending,
+    QueueFull,
+    Error,
+};
+
 class Database {
 public:
     Database();
@@ -33,6 +46,15 @@ public:
                         const std::string& password_hash,
                         int64_t& user_id_out);
     bool deleteUser(const std::string& username, int64_t& user_id_out);
+
+    // Registration approval operations
+    RegistrationRequestResult submitRegistration(const std::string& username,
+                                                  const std::string& password_hash);
+    bool isRegistrationPending(const std::string& username);
+    bool getRegistrationRequests(std::vector<RegistrationRequest>& requests_out);
+    bool approveRegistration(const std::string& username, int64_t& user_id_out);
+    bool rejectRegistration(const std::string& username);
+    void cleanupExpiredRegistrationRequests();
 
     // Session operations
     bool createSession(const std::string& token, int64_t user_id, int64_t expires_at);

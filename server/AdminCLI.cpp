@@ -94,6 +94,9 @@ void PrintHelp() {
     std::cout
         << "cim-server management commands:\n"
         << "  cim-server users              List registered users and status\n"
+        << "  cim-server pending            List registration requests\n"
+        << "  cim-server approve <username> Approve a registration request\n"
+        << "  cim-server reject <username>  Reject a registration request\n"
         << "  cim-server passwd <username>  Change a user's password\n"
         << "  cim-server delete <username>  Delete a user\n"
         << "  cim-server help               Show this help\n";
@@ -147,7 +150,8 @@ bool IsAdminCommand(int argc, char** argv) {
         return false;
     }
     std::string command = argv[1];
-    return command == "users" || command == "passwd" || command == "delete" ||
+    return command == "users" || command == "pending" || command == "approve" ||
+           command == "reject" || command == "passwd" || command == "delete" ||
            command == "help" || command == "--help" || command == "-h";
 }
 
@@ -157,11 +161,12 @@ int RunAdminCommand(int argc, char** argv) {
         PrintHelp();
         return 0;
     }
-    if ((command == "passwd" || command == "delete") && argc != 3) {
+    if ((command == "approve" || command == "reject" || command == "passwd" ||
+         command == "delete") && argc != 3) {
         PrintHelp();
         return 2;
     }
-    if (command == "users" && argc != 2) {
+    if ((command == "users" || command == "pending") && argc != 2) {
         PrintHelp();
         return 2;
     }
@@ -183,14 +188,18 @@ int RunAdminCommand(int argc, char** argv) {
         }
         request["username"] = argv[2];
         request["password"] = std::move(password);
-    } else if (command == "delete") {
-        std::cout << "Type '" << argv[2] << "' to confirm deletion: " << std::flush;
+    } else if (command == "delete" || command == "reject") {
+        const char* action = command == "delete" ? "deletion" : "rejection";
+        std::cout << "Type '" << argv[2] << "' to confirm " << action << ": " << std::flush;
         std::string confirmation;
         std::getline(std::cin, confirmation);
         if (confirmation != argv[2]) {
-            std::cerr << "Deletion cancelled" << std::endl;
+            std::cerr << (command == "delete" ? "Deletion cancelled" : "Rejection cancelled")
+                      << std::endl;
             return 2;
         }
+        request["username"] = argv[2];
+    } else if (command == "approve") {
         request["username"] = argv[2];
     }
 
@@ -255,7 +264,15 @@ int RunAdminCommand(int argc, char** argv) {
                       << std::setw(8) << user.value("id", int64_t{-1})
                       << std::setw(24) << user.value("username", "")
                       << std::setw(20) << FormatTime(user.value("created_at", int64_t{0}))
-                      << (user.value("online", false) ? "online" : "offline") << '\n';
+                       << (user.value("online", false) ? "online" : "offline") << '\n';
+        }
+    } else if (command == "pending") {
+        std::cout << std::left << std::setw(24) << "USERNAME"
+                  << "REQUESTED AT" << '\n';
+        for (const auto& registration : result.value("requests", nlohmann::json::array())) {
+            std::cout << std::left
+                      << std::setw(24) << registration.value("username", "")
+                      << FormatTime(registration.value("requested_at", int64_t{0})) << '\n';
         }
     } else {
         std::cout << result.value("message", "Operation completed") << std::endl;
