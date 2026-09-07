@@ -19,6 +19,7 @@ struct UserRecord {
 struct RegistrationRequest {
     std::string username;
     int64_t requested_at;
+    std::string watch_token;
 };
 
 enum class RegistrationRequestResult {
@@ -49,11 +50,19 @@ public:
 
     // Registration approval operations
     RegistrationRequestResult submitRegistration(const std::string& username,
-                                                  const std::string& password_hash);
+                                                  const std::string& password_hash,
+                                                  const std::string& watch_token);
     bool isRegistrationPending(const std::string& username);
+    bool getRegistrationRequest(const std::string& username,
+                                RegistrationRequest& request_out);
     bool getRegistrationRequests(std::vector<RegistrationRequest>& requests_out);
     bool approveRegistration(const std::string& username, int64_t& user_id_out);
-    bool rejectRegistration(const std::string& username);
+    bool rejectRegistration(const std::string& username, const std::string& reason);
+    bool getRegistrationRejection(const std::string& username,
+                                  const std::string& watch_token,
+                                  std::string& reason_out);
+    bool isRegistrationApproved(const std::string& username,
+                                const std::string& watch_token);
     void cleanupExpiredRegistrationRequests();
 
     // Session operations

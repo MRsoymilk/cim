@@ -1,8 +1,12 @@
 #include "ftxui/component/screen_interactive.hpp"
 #include "ftxui/component/event.hpp"
 #include "ui/ChatUI.hpp"
+#include <sodium.h>
 
 int main() {
+  if (sodium_init() < 0) {
+    return 1;
+  }
   auto screen = ftxui::ScreenInteractive::Fullscreen();
 
   cim::ChatUI chat_ui([&screen] {

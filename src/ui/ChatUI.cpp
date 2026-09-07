@@ -5,6 +5,7 @@
 #include <ixwebsocket/IXNetSystem.h>
 #include <ixwebsocket/IXWebSocket.h>
 #include <nlohmann/json.hpp>
+#include <sodium.h>
 #include <algorithm>
 #include <charconv>
 #include <cctype>
@@ -46,6 +47,26 @@ std::string Trim(std::string value) {
     value.erase(value.begin(), std::find_if(value.begin(), value.end(), is_not_space));
     value.erase(std::find_if(value.rbegin(), value.rend(), is_not_space).base(), value.end());
     return value;
+}
+
+bool EqualUsernames(const std::string& left, const std::string& right) {
+    return left.size() == right.size() &&
+        std::equal(left.begin(), left.end(), right.begin(), [](unsigned char a, unsigned char b) {
+            return std::tolower(a) == std::tolower(b);
+        });
+}
+
+std::string GenerateWatchToken() {
+    static constexpr char hex[] = "0123456789abcdef";
+    unsigned char bytes[32];
+    randombytes_buf(bytes, sizeof(bytes));
+    std::string token;
+    token.reserve(64);
+    for (unsigned char byte : bytes) {
+        token.push_back(hex[byte >> 4U]);
+        token.push_back(hex[byte & 0x0fU]);
+    }
+    return token;
 }
 
 } // namespace
@@ -277,14 +298,44 @@ bool ChatUI::PerformAuth(bool is_register) {
         auth_error_ = "Server is not connected";
         return false;
     }
+    if (is_register &&
+        (registration_request_in_flight_ || !registration_request_username_.empty())) {
+        auth_error_ = "A registration request is already awaiting a response";
+        return false;
+    }
+    if (is_register && !pending_registration_username_.empty()) {
+        auto result = websocket_->send(nlohmann::json{
+            {"type", "registration_watch"},
+            {"username", pending_registration_username_},
+            {"watch_token", pending_registration_watch_token_},
+        }.dump());
+        if (!result.success) {
+            auth_error_ = "Failed to check the existing registration request";
+            return false;
+        }
+        auth_error_.clear();
+        auth_notice_ = "Checking the existing registration request...";
+        return true;
+    }
 
     nlohmann::json request = {
         {"type", is_register ? "register" : "login"},
         {"username", auth_username_},
         {"password", auth_password_},
     };
+    if (is_register) {
+        registration_request_username_ = auth_username_;
+        registration_request_watch_token_ = GenerateWatchToken();
+        request["watch_token"] = registration_request_watch_token_;
+        registration_request_in_flight_ = true;
+    }
     auto result = websocket_->send(request.dump());
     if (!result.success) {
+        if (is_register) {
+            registration_request_username_.clear();
+            registration_request_watch_token_.clear();
+            registration_request_in_flight_ = false;
+        }
         auth_error_ = "Failed to send authentication request";
         return false;
     }
@@ -356,6 +407,11 @@ void ChatUI::ReconnectWebSocket() {
     websocket_connected_ = false;
     websocket_authenticated_ = false;
     auth_token_.clear();
+    pending_registration_username_.clear();
+    pending_registration_watch_token_.clear();
+    registration_request_username_.clear();
+    registration_request_watch_token_.clear();
+    registration_request_in_flight_ = false;
     auth_password_.clear();
     my_user_id_ = -1;
     my_name_.clear();
@@ -430,12 +486,25 @@ void ChatUI::DrainSocketEvents() {
                     {"type", "resume"},
                     {"token", auth_token_},
                 }.dump());
+            } else if (!pending_registration_username_.empty()) {
+                websocket_->send(nlohmann::json{
+                    {"type", "registration_watch"},
+                    {"username", pending_registration_username_},
+                    {"watch_token", pending_registration_watch_token_},
+                }.dump());
+            } else if (!registration_request_username_.empty()) {
+                websocket_->send(nlohmann::json{
+                    {"type", "registration_watch"},
+                    {"username", registration_request_username_},
+                    {"watch_token", registration_request_watch_token_},
+                }.dump());
             } else {
                 auth_error_.clear();
             }
             continue;
         }
         if (event.type == SocketEventType::Disconnected) {
+            registration_request_in_flight_ = false;
             if (auth_state_ == AuthState::LoggedIn) {
                 notification_ = "Disconnected; reconnecting...";
             } else {
@@ -444,6 +513,7 @@ void ChatUI::DrainSocketEvents() {
             continue;
         }
         if (event.type == SocketEventType::Error) {
+            registration_request_in_flight_ = false;
             if (auth_state_ == AuthState::LoggedIn) {
                 notification_ = "WebSocket: " + event.content;
             } else {
@@ -464,12 +534,39 @@ void ChatUI::DrainSocketEvents() {
             if (auth_state_ == AuthState::LoggedIn) {
                 notification_ = error;
             } else {
+                if (registration_request_in_flight_) {
+                    registration_request_username_.clear();
+                    registration_request_watch_token_.clear();
+                    registration_request_in_flight_ = false;
+                }
                 auth_notice_.clear();
                 auth_error_ = error;
             }
             continue;
         }
         if (type == "registration_pending") {
+            const std::string username = payload.value(
+                "username",
+                pending_registration_username_.empty()
+                    ? auth_username_
+                    : pending_registration_username_);
+            const std::string watch_token = payload.value("watch_token", "");
+            const bool matches_pending =
+                EqualUsernames(username, pending_registration_username_) &&
+                watch_token == pending_registration_watch_token_;
+            const bool matches_request =
+                EqualUsernames(username, registration_request_username_) &&
+                watch_token == registration_request_watch_token_;
+            if (auth_state_ == AuthState::LoggedIn ||
+                (!matches_pending && !matches_request)) {
+                continue;
+            }
+            registration_request_in_flight_ = false;
+            pending_registration_username_ = username;
+            pending_registration_watch_token_ = watch_token;
+            registration_request_username_.clear();
+            registration_request_watch_token_.clear();
+            auth_username_ = username;
             auth_state_ = AuthState::Login;
             auth_action_label_ = "SIGN IN";
             auth_switch_label_ = "New here? Create an account";
@@ -480,8 +577,71 @@ void ChatUI::DrainSocketEvents() {
             login_username_input_->TakeFocus();
             continue;
         }
+        if (type == "registration_approved") {
+            const std::string username = payload.value("username", "");
+            const std::string watch_token = payload.value("watch_token", "");
+            const bool matches_pending =
+                EqualUsernames(username, pending_registration_username_) &&
+                watch_token == pending_registration_watch_token_;
+            const bool matches_request =
+                EqualUsernames(username, registration_request_username_) &&
+                watch_token == registration_request_watch_token_;
+            if (auth_state_ == AuthState::LoggedIn ||
+                (!matches_pending && !matches_request)) {
+                continue;
+            }
+            pending_registration_username_.clear();
+            pending_registration_watch_token_.clear();
+            registration_request_username_.clear();
+            registration_request_watch_token_.clear();
+            registration_request_in_flight_ = false;
+            auth_state_ = AuthState::Login;
+            auth_action_label_ = "SIGN IN";
+            auth_switch_label_ = "New here? Create an account";
+            auth_password_.clear();
+            auth_error_.clear();
+            auth_notice_ = payload.value(
+                "message", "Registration approved. Sign in to continue");
+            login_password_input_->TakeFocus();
+            continue;
+        }
+        if (type == "registration_rejected") {
+            const std::string username = payload.value("username", "");
+            const std::string watch_token = payload.value("watch_token", "");
+            const bool matches_pending =
+                EqualUsernames(username, pending_registration_username_) &&
+                watch_token == pending_registration_watch_token_;
+            const bool matches_request =
+                EqualUsernames(username, registration_request_username_) &&
+                watch_token == registration_request_watch_token_;
+            if (auth_state_ == AuthState::LoggedIn ||
+                (!matches_pending && !matches_request)) {
+                continue;
+            }
+            pending_registration_username_.clear();
+            pending_registration_watch_token_.clear();
+            registration_request_username_.clear();
+            registration_request_watch_token_.clear();
+            registration_request_in_flight_ = false;
+            auth_state_ = AuthState::Register;
+            auth_action_label_ = "CREATE ACCOUNT";
+            auth_switch_label_ = "Already registered? Sign in";
+            auth_password_.clear();
+            auth_notice_.clear();
+            const std::string reason = payload.value("reason", "");
+            auth_error_ = reason.empty()
+                ? payload.value("message", "Registration rejected; you may submit a new request")
+                : "Registration rejected: " + reason;
+            login_password_input_->TakeFocus();
+            continue;
+        }
         if (type == "auth_success") {
             auth_token_ = payload.value("token", "");
+            pending_registration_username_.clear();
+            pending_registration_watch_token_.clear();
+            registration_request_username_.clear();
+            registration_request_watch_token_.clear();
+            registration_request_in_flight_ = false;
             my_user_id_ = payload.value("user_id", int64_t{-1});
             my_name_ = payload.value("username", auth_username_);
             auth_password_.clear();

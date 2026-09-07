@@ -29,6 +29,11 @@ struct Session {
     std::string username;
 };
 
+struct RegistrationWatcher {
+    std::string username;
+    std::string watch_token;
+};
+
 std::string GenerateToken() {
     unsigned char bytes[32];
     randombytes_buf(bytes, sizeof(bytes));
@@ -47,6 +52,32 @@ bool IsValidUsername(const std::string& username) {
     return std::all_of(username.begin(), username.end(), [](unsigned char character) {
         return std::isalnum(character) || character == '_' || character == '-' || character == '.';
     });
+}
+
+std::string NormalizeUsername(std::string username) {
+    std::transform(username.begin(), username.end(), username.begin(), [](unsigned char character) {
+        return static_cast<char>(std::tolower(character));
+    });
+    return username;
+}
+
+bool IsValidRejectionReason(const std::string& reason) {
+    if (reason.empty() || reason.size() > 500 ||
+        std::any_of(reason.begin(), reason.end(), [](unsigned char character) {
+            return character < 0x20 || character == 0x7f;
+        })) {
+        return false;
+    }
+    return std::any_of(reason.begin(), reason.end(), [](unsigned char character) {
+        return !std::isspace(character);
+    });
+}
+
+bool IsValidWatchToken(const std::string& token) {
+    return token.size() == 64 &&
+        std::all_of(token.begin(), token.end(), [](unsigned char character) {
+            return std::isxdigit(character);
+        });
 }
 
 } // namespace
@@ -92,6 +123,8 @@ int main(int argc, char** argv) {
 
     std::mutex sessions_mutex;
     std::unordered_map<ix::WebSocket*, Session> sessions;
+    std::mutex registration_watchers_mutex;
+    std::unordered_map<ix::WebSocket*, RegistrationWatcher> registration_watchers;
     std::mutex registration_attempts_mutex;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> registration_attempts;
 
@@ -147,6 +180,43 @@ int main(int argc, char** argv) {
         broadcastUsers();
     };
 
+    auto takeRegistrationRecipients = [&](const cim::RegistrationRequest& registration) {
+        std::vector<std::shared_ptr<ix::WebSocket>> recipients;
+        const std::string normalized_username = NormalizeUsername(registration.username);
+        auto connected = server.getClients();
+        for (const auto& socket : connected) {
+            auto watcher = registration_watchers.find(socket.get());
+            if (watcher != registration_watchers.end() &&
+                watcher->second.username == normalized_username &&
+                watcher->second.watch_token == registration.watch_token) {
+                recipients.push_back(socket);
+                registration_watchers.erase(watcher);
+            }
+        }
+        return recipients;
+    };
+
+    auto notifyRegistration = [](const std::vector<std::shared_ptr<ix::WebSocket>>& recipients,
+                                 const std::string& username,
+                                 const std::string& watch_token,
+                                 const std::string& type,
+                                 const std::string& notification,
+                                 const std::string& reason) {
+        json response = {
+            {"type", type},
+            {"username", username},
+            {"watch_token", watch_token},
+            {"message", notification},
+        };
+        if (!reason.empty()) {
+            response["reason"] = reason;
+        }
+        const std::string payload = response.dump();
+        for (const auto& socket : recipients) {
+            socket->send(payload);
+        }
+    };
+
     server.setOnClientMessageCallback(
         [&](std::shared_ptr<ix::ConnectionState> connection_state,
             ix::WebSocket& socket,
@@ -157,6 +227,10 @@ int main(int argc, char** argv) {
             }
             if (message->type == ix::WebSocketMessageType::Close) {
                 std::string username;
+                {
+                    std::lock_guard lock(registration_watchers_mutex);
+                    registration_watchers.erase(&socket);
+                }
                 {
                     std::lock_guard lock(sessions_mutex);
                     auto session = sessions.find(&socket);
@@ -201,6 +275,11 @@ int main(int argc, char** argv) {
                             sendError("Password must not exceed 256 characters");
                             return;
                         }
+                        const std::string watch_token = request.value("watch_token", "");
+                        if (!IsValidWatchToken(watch_token)) {
+                            sendError("Invalid registration watch token");
+                            return;
+                        }
                         const auto now = std::chrono::steady_clock::now();
                         {
                             std::lock_guard lock(registration_attempts_mutex);
@@ -239,7 +318,28 @@ int main(int argc, char** argv) {
                             sendError("Password hashing failed");
                             return;
                         }
-                        const auto registration = db.submitRegistration(username, password_hash);
+                        cim::RegistrationRequestResult registration;
+                        {
+                            std::lock_guard lock(registration_watchers_mutex);
+                            registration = db.submitRegistration(username, password_hash, watch_token);
+                            if (registration == cim::RegistrationRequestResult::Submitted) {
+                                cim::RegistrationRequest stored_request;
+                                if (db.getRegistrationRequest(username, stored_request)) {
+                                    registration_watchers.insert_or_assign(
+                                        &socket,
+                                        RegistrationWatcher{
+                                            NormalizeUsername(stored_request.username),
+                                            stored_request.watch_token,
+                                        });
+                                }
+                                socket.send(json{
+                                    {"type", "registration_pending"},
+                                    {"username", username},
+                                    {"watch_token", watch_token},
+                                    {"message", "Registration submitted; wait for administrator approval, then sign in"},
+                                }.dump());
+                            }
+                        }
                         if (registration == cim::RegistrationRequestResult::UsernameExists) {
                             sendError("Username already exists");
                             return;
@@ -256,10 +356,6 @@ int main(int argc, char** argv) {
                             sendError("Unable to submit registration request");
                             return;
                         }
-                        socket.send(json{
-                            {"type", "registration_pending"},
-                            {"message", "Registration submitted; wait for administrator approval, then sign in"},
-                        }.dump());
                         std::cout << "[Server] Registration awaiting approval: " << username << std::endl;
                         return;
                     } else {
@@ -281,6 +377,10 @@ int main(int argc, char** argv) {
 
                     std::string token = GenerateToken();
                     db.createSession(token, user_id, std::time(nullptr) + 86400 * 7);
+                    {
+                        std::lock_guard lock(registration_watchers_mutex);
+                        registration_watchers.erase(&socket);
+                    }
                     {
                         std::lock_guard lock(sessions_mutex);
                         sessions.insert_or_assign(&socket, Session{user_id, username});
@@ -306,6 +406,10 @@ int main(int argc, char** argv) {
                         return;
                     }
                     {
+                        std::lock_guard lock(registration_watchers_mutex);
+                        registration_watchers.erase(&socket);
+                    }
+                    {
                         std::lock_guard lock(sessions_mutex);
                         sessions.insert_or_assign(&socket, Session{user_id, username});
                     }
@@ -316,6 +420,63 @@ int main(int argc, char** argv) {
                         {"username", username},
                     }.dump());
                     broadcastUsers();
+                    return;
+                }
+
+                if (type == "registration_watch") {
+                    std::string username = request.value("username", "");
+                    std::string watch_token = request.value("watch_token", "");
+                    if (!IsValidUsername(username) || !IsValidWatchToken(watch_token)) {
+                        sendError("Invalid registration username");
+                        return;
+                    }
+                    {
+                        std::lock_guard lock(registration_watchers_mutex);
+                        cim::RegistrationRequest registration;
+                        if (db.getRegistrationRequest(username, registration) &&
+                            registration.watch_token.size() == watch_token.size() &&
+                            sodium_memcmp(
+                                registration.watch_token.data(),
+                                watch_token.data(),
+                                watch_token.size()) == 0) {
+                            registration_watchers.insert_or_assign(
+                                &socket,
+                                RegistrationWatcher{
+                                    NormalizeUsername(registration.username),
+                                    registration.watch_token,
+                                });
+                            socket.send(json{
+                                {"type", "registration_pending"},
+                                {"username", registration.username},
+                                {"watch_token", registration.watch_token},
+                                {"message", "Registration is awaiting administrator approval"},
+                            }.dump());
+                            return;
+                        }
+
+                        registration_watchers.erase(&socket);
+                        if (db.isRegistrationApproved(username, watch_token)) {
+                            socket.send(json{
+                                {"type", "registration_approved"},
+                                {"username", username},
+                                {"watch_token", watch_token},
+                                {"message", "Registration approved. Sign in to continue"},
+                            }.dump());
+                        } else {
+                            std::string reason;
+                            const bool was_rejected = db.getRegistrationRejection(
+                                username, watch_token, reason);
+                            socket.send(json{
+                                {"type", "registration_rejected"},
+                                {"username", username},
+                                {"watch_token", watch_token},
+                                {"message", was_rejected
+                                    ? "Registration rejected: " + reason
+                                    : "Registration is no longer pending; you may submit a new request"},
+                                {"reason", was_rejected ? reason : ""},
+                            }.dump());
+                        }
+                    }
                     return;
                 }
 
@@ -450,10 +611,24 @@ int main(int argc, char** argv) {
             }
             if (command == "approve") {
                 int64_t user_id = -1;
-                if (!db.approveRegistration(username, user_id)) {
-                    sendError("Registration request not found or approval failed");
-                    return;
+                cim::RegistrationRequest registration;
+                std::vector<std::shared_ptr<ix::WebSocket>> recipients;
+                {
+                    std::lock_guard lock(registration_watchers_mutex);
+                    if (!db.getRegistrationRequest(username, registration) ||
+                        !db.approveRegistration(username, user_id)) {
+                        sendError("Registration request not found or approval failed");
+                        return;
+                    }
+                    recipients = takeRegistrationRecipients(registration);
                 }
+                notifyRegistration(
+                    recipients,
+                    registration.username,
+                    registration.watch_token,
+                    "registration_approved",
+                    "Registration approved. Sign in to continue",
+                    "");
                 broadcastUsers();
                 socket.send(json{
                     {"success", true},
@@ -462,10 +637,30 @@ int main(int argc, char** argv) {
                 return;
             }
             if (command == "reject") {
-                if (!db.rejectRegistration(username)) {
-                    sendError("Registration request not found or rejection failed");
+                if (!request.contains("reason") || !request["reason"].is_string() ||
+                    !IsValidRejectionReason(request["reason"].get_ref<const std::string&>())) {
+                    sendError("Rejection reason is required and must be at most 500 bytes without control characters");
                     return;
                 }
+                const std::string reason = request["reason"].get<std::string>();
+                cim::RegistrationRequest registration;
+                std::vector<std::shared_ptr<ix::WebSocket>> recipients;
+                {
+                    std::lock_guard lock(registration_watchers_mutex);
+                    if (!db.getRegistrationRequest(username, registration) ||
+                        !db.rejectRegistration(username, reason)) {
+                        sendError("Registration request not found or rejection failed");
+                        return;
+                    }
+                    recipients = takeRegistrationRecipients(registration);
+                }
+                notifyRegistration(
+                    recipients,
+                    registration.username,
+                    registration.watch_token,
+                    "registration_rejected",
+                    "Registration rejected: " + reason,
+                    reason);
                 socket.send(json{
                     {"success", true},
                     {"message", "Registration rejected"},

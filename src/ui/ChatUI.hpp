@@ -63,6 +63,11 @@ private:
     std::string auth_error_ = "";
     std::string auth_notice_ = "";
     std::string auth_token_ = "";
+    std::string pending_registration_username_ = "";
+    std::string pending_registration_watch_token_ = "";
+    std::string registration_request_username_ = "";
+    std::string registration_request_watch_token_ = "";
+    bool registration_request_in_flight_ = false;
     std::string auth_action_label_ = "SIGN IN";
     std::string auth_switch_label_ = "New here? Create an account";
     int64_t my_user_id_ = -1;

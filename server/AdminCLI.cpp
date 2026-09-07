@@ -38,6 +38,15 @@ bool IsHexKey(const std::string& key) {
         });
 }
 
+std::string Trim(std::string value) {
+    auto is_not_space = [](unsigned char character) {
+        return !std::isspace(character);
+    };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), is_not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), is_not_space).base(), value.end());
+    return value;
+}
+
 std::string ReadHiddenLine(const std::string& prompt) {
     std::cout << prompt << std::flush;
 #ifdef _WIN32
@@ -199,6 +208,25 @@ int RunAdminCommand(int argc, char** argv) {
             return 2;
         }
         request["username"] = argv[2];
+        if (command == "reject") {
+            std::cout << "Rejection reason: " << std::flush;
+            std::string reason;
+            std::getline(std::cin, reason);
+            reason = Trim(std::move(reason));
+            if (reason.empty()) {
+                std::cerr << "Rejection cancelled: reason is required" << std::endl;
+                return 2;
+            }
+            if (reason.size() > 500 ||
+                std::any_of(reason.begin(), reason.end(), [](unsigned char character) {
+                    return character < 0x20 || character == 0x7f;
+                })) {
+                std::cerr << "Rejection cancelled: reason must be at most 500 bytes without control characters"
+                          << std::endl;
+                return 2;
+            }
+            request["reason"] = std::move(reason);
+        }
     } else if (command == "approve") {
         request["username"] = argv[2];
     }
