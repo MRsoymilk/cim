@@ -762,6 +762,48 @@ bool Database::createSession(const std::string& token, int64_t user_id, int64_t 
     return success;
 }
 
+bool Database::resumeSession(const std::string& token,
+                             int64_t expires_at,
+                             int64_t& user_id_out,
+                             std::string& username_out) {
+    std::lock_guard lock(mutex_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(
+            db_,
+            "SELECT s.user_id, u.username FROM sessions s "
+            "JOIN users u ON s.user_id = u.id WHERE s.token = ? AND s.expires_at > ?;",
+            -1,
+            &stmt,
+            nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, std::time(nullptr));
+    bool success = sqlite3_step(stmt) == SQLITE_ROW;
+    if (success) {
+        const unsigned char* username = sqlite3_column_text(stmt, 1);
+        success = username != nullptr;
+        if (success) {
+            user_id_out = sqlite3_column_int64(stmt, 0);
+            username_out = reinterpret_cast<const char*>(username);
+        }
+    }
+    sqlite3_finalize(stmt);
+
+    stmt = nullptr;
+    if (success) {
+        success = sqlite3_prepare_v2(
+            db_, "UPDATE sessions SET expires_at = ? WHERE token = ?;", -1, &stmt, nullptr) == SQLITE_OK;
+    }
+    if (success) {
+        sqlite3_bind_int64(stmt, 1, expires_at);
+        sqlite3_bind_text(stmt, 2, token.c_str(), -1, SQLITE_TRANSIENT);
+        success = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+    }
+    sqlite3_finalize(stmt);
+    return success;
+}
+
 bool Database::getUserByToken(const std::string& token, int64_t& user_id_out, std::string& username_out) {
     std::lock_guard lock(mutex_);
     std::string sql = "SELECT s.user_id, u.username FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.token = ? AND s.expires_at > ?;";
@@ -784,15 +826,17 @@ bool Database::getUserByToken(const std::string& token, int64_t& user_id_out, st
     return found;
 }
 
-void Database::deleteSession(const std::string& token) {
+bool Database::deleteSession(const std::string& token) {
     std::lock_guard lock(mutex_);
     std::string sql = "DELETE FROM sessions WHERE token = ?;";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, token.c_str(), -1, SQLITE_STATIC);
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
     }
+    sqlite3_bind_text(stmt, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    const bool success = sqlite3_step(stmt) == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    return success;
 }
 
 void Database::cleanupExpiredSessions() {

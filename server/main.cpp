@@ -27,7 +27,10 @@ namespace {
 struct Session {
     int64_t user_id;
     std::string username;
+    std::string token;
 };
+
+constexpr int64_t kSessionLifetimeSeconds = 86400 * 30;
 
 struct RegistrationWatcher {
     std::string username;
@@ -162,22 +165,16 @@ int main(int argc, char** argv) {
         }
     };
 
-    auto disconnectUser = [&](int64_t user_id, const std::string& reason) {
-        auto clients = authenticatedClients();
-        {
-            std::lock_guard lock(sessions_mutex);
-            for (const auto& [socket, session] : clients) {
-                if (session.user_id == user_id) {
-                    sessions.erase(socket.get());
-                }
+    auto takeUserClients = [&](int64_t user_id) {
+        std::vector<std::shared_ptr<ix::WebSocket>> clients;
+        for (const auto& socket : server.getClients()) {
+            auto session = sessions.find(socket.get());
+            if (session != sessions.end() && session->second.user_id == user_id) {
+                clients.push_back(socket);
+                sessions.erase(session);
             }
         }
-        for (const auto& [socket, session] : clients) {
-            if (session.user_id == user_id) {
-                socket->close(4001, reason);
-            }
-        }
-        broadcastUsers();
+        return clients;
     };
 
     auto takeRegistrationRecipients = [&](const cim::RegistrationRequest& registration) {
@@ -358,32 +355,43 @@ int main(int argc, char** argv) {
                         }
                         std::cout << "[Server] Registration awaiting approval: " << username << std::endl;
                         return;
-                    } else {
-                        std::string password_hash;
-                        if (!db.getUser(username, user_id, password_hash)) {
-                            if (db.isRegistrationPending(username)) {
-                                sendError("Registration is awaiting administrator approval");
-                            } else {
-                                sendError("Invalid username or password");
-                            }
-                            return;
-                        }
-                        if (crypto_pwhash_str_verify(
-                                password_hash.c_str(), password.c_str(), password.size()) != 0) {
+                    }
+
+                    std::string password_hash;
+                    if (!db.getUser(username, user_id, password_hash)) {
+                        if (db.isRegistrationPending(username)) {
+                            sendError("Registration is awaiting administrator approval");
+                        } else {
                             sendError("Invalid username or password");
-                            return;
                         }
+                        return;
+                    }
+                    if (crypto_pwhash_str_verify(
+                            password_hash.c_str(), password.c_str(), password.size()) != 0) {
+                        sendError("Invalid username or password");
+                        return;
                     }
 
                     std::string token = GenerateToken();
-                    db.createSession(token, user_id, std::time(nullptr) + 86400 * 7);
+                    {
+                        std::lock_guard lock(sessions_mutex);
+                        int64_t current_user_id = -1;
+                        std::string current_password_hash;
+                        if (!db.getUser(username, current_user_id, current_password_hash) ||
+                            current_user_id != user_id || current_password_hash != password_hash) {
+                            sendError("Account changed during sign in; try again");
+                            return;
+                        }
+                        if (!db.createSession(
+                                token, user_id, std::time(nullptr) + kSessionLifetimeSeconds)) {
+                            sendError("Unable to create session");
+                            return;
+                        }
+                        sessions.insert_or_assign(&socket, Session{user_id, username, token});
+                    }
                     {
                         std::lock_guard lock(registration_watchers_mutex);
                         registration_watchers.erase(&socket);
-                    }
-                    {
-                        std::lock_guard lock(sessions_mutex);
-                        sessions.insert_or_assign(&socket, Session{user_id, username});
                     }
                     socket.send(json{
                         {"type", "auth_success"},
@@ -401,17 +409,32 @@ int main(int argc, char** argv) {
                     int64_t user_id = -1;
                     std::string username;
                     std::string token = request.value("token", "");
-                    if (token.empty() || !db.getUserByToken(token, user_id, username)) {
-                        sendError("Session expired; sign in again");
+                    bool resumed = false;
+                    {
+                        std::lock_guard lock(sessions_mutex);
+                        if (!token.empty()) {
+                            resumed = db.resumeSession(
+                                token,
+                                std::time(nullptr) + kSessionLifetimeSeconds,
+                                user_id,
+                                username);
+                        }
+                        if (resumed) {
+                            sessions.insert_or_assign(&socket, Session{user_id, username, token});
+                        } else if (!token.empty()) {
+                            db.deleteSession(token);
+                        }
+                    }
+                    if (!resumed) {
+                        socket.send(json{
+                            {"type", "session_invalid"},
+                            {"message", "Session expired; sign in again"},
+                        }.dump());
                         return;
                     }
                     {
                         std::lock_guard lock(registration_watchers_mutex);
                         registration_watchers.erase(&socket);
-                    }
-                    {
-                        std::lock_guard lock(sessions_mutex);
-                        sessions.insert_or_assign(&socket, Session{user_id, username});
                     }
                     socket.send(json{
                         {"type", "auth_success"},
@@ -492,6 +515,32 @@ int main(int argc, char** argv) {
                 }
 
                 if (type == "users") {
+                    broadcastUsers();
+                    return;
+                }
+                if (type == "logout") {
+                    std::vector<std::shared_ptr<ix::WebSocket>> revoked_clients;
+                    auto connected = server.getClients();
+                    {
+                        std::lock_guard lock(sessions_mutex);
+                        if (!db.deleteSession(sender.token)) {
+                            sendError("Unable to revoke session");
+                            return;
+                        }
+                        for (const auto& client : connected) {
+                            auto session = sessions.find(client.get());
+                            if (session != sessions.end() && session->second.token == sender.token) {
+                                if (client.get() != &socket) {
+                                    revoked_clients.push_back(client);
+                                }
+                                sessions.erase(session);
+                            }
+                        }
+                    }
+                    socket.send(json{{"type", "logout_success"}}.dump());
+                    for (const auto& client : revoked_clients) {
+                        client->close(4001, "Session signed out");
+                    }
                     broadcastUsers();
                     return;
                 }
@@ -685,11 +734,19 @@ int main(int argc, char** argv) {
                     return;
                 }
                 int64_t user_id = -1;
-                if (!db.changePassword(username, password_hash, user_id)) {
-                    sendError("User not found or password update failed");
-                    return;
+                std::vector<std::shared_ptr<ix::WebSocket>> revoked_clients;
+                {
+                    std::lock_guard lock(sessions_mutex);
+                    if (!db.changePassword(username, password_hash, user_id)) {
+                        sendError("User not found or password update failed");
+                        return;
+                    }
+                    revoked_clients = takeUserClients(user_id);
                 }
-                disconnectUser(user_id, "Password changed by administrator");
+                for (const auto& client : revoked_clients) {
+                    client->close(4001, "Password changed by administrator");
+                }
+                broadcastUsers();
                 socket.send(json{
                     {"success", true},
                     {"message", "Password changed; existing sessions were revoked"},
@@ -698,11 +755,19 @@ int main(int argc, char** argv) {
             }
             if (command == "delete") {
                 int64_t user_id = -1;
-                if (!db.deleteUser(username, user_id)) {
-                    sendError("User not found or deletion failed");
-                    return;
+                std::vector<std::shared_ptr<ix::WebSocket>> revoked_clients;
+                {
+                    std::lock_guard lock(sessions_mutex);
+                    if (!db.deleteUser(username, user_id)) {
+                        sendError("User not found or deletion failed");
+                        return;
+                    }
+                    revoked_clients = takeUserClients(user_id);
                 }
-                disconnectUser(user_id, "Account deleted by administrator");
+                for (const auto& client : revoked_clients) {
+                    client->close(4001, "Account deleted by administrator");
+                }
+                broadcastUsers();
                 socket.send(json{
                     {"success", true},
                     {"message", "User deleted"},

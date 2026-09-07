@@ -76,6 +76,11 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
     ix::initNetSystem();
     websocket_ = std::make_unique<ix::WebSocket>();
     client_config_ = ClientConfig::Load();
+    auth_username_ = client_config_.username;
+    auth_token_ = client_config_.session_token;
+    if (!auth_token_.empty()) {
+        auth_notice_ = "Restoring saved session...";
+    }
     settings_host_ = client_config_.host;
     settings_port_ = std::to_string(client_config_.port);
 
@@ -146,6 +151,9 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
 
     chat_settings_btn_ = ftxui::Button("Settings", [this] {
         OpenSettings();
+    }, secondary_button);
+    sign_out_btn_ = ftxui::Button("SIGN OUT", [this] {
+        SignOut();
     }, secondary_button);
 
     ftxui::InputOption settings_input_option;
@@ -256,6 +264,7 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
 
     left_container_ = ftxui::Container::Vertical({
         name_button_,
+        sign_out_btn_,
         chat_settings_btn_,
         search_input_,
         contact_menu_,
@@ -296,6 +305,10 @@ bool ChatUI::PerformAuth(bool is_register) {
 
     if (!websocket_connected_) {
         auth_error_ = "Server is not connected";
+        return false;
+    }
+    if (!auth_token_.empty() && auth_state_ != AuthState::LoggedIn) {
+        auth_error_ = "Restoring the saved session...";
         return false;
     }
     if (is_register &&
@@ -387,6 +400,10 @@ void ChatUI::SaveSettings() {
     }
 
     ClientConfig updated{host, static_cast<uint16_t>(port)};
+    if (updated.host == client_config_.host && updated.port == client_config_.port) {
+        updated.username = client_config_.username;
+        updated.session_token = client_config_.session_token;
+    }
     if (!updated.Save(settings_error_)) {
         return;
     }
@@ -406,12 +423,13 @@ void ChatUI::ReconnectWebSocket() {
 
     websocket_connected_ = false;
     websocket_authenticated_ = false;
-    auth_token_.clear();
+    auth_token_ = client_config_.session_token;
     pending_registration_username_.clear();
     pending_registration_watch_token_.clear();
     registration_request_username_.clear();
     registration_request_watch_token_.clear();
     registration_request_in_flight_ = false;
+    auth_username_ = client_config_.username;
     auth_password_.clear();
     my_user_id_ = -1;
     my_name_.clear();
@@ -421,7 +439,7 @@ void ChatUI::ReconnectWebSocket() {
     selected_contact_index_ = 0;
     notification_.clear();
     auth_error_.clear();
-    auth_notice_.clear();
+    auth_notice_ = auth_token_.empty() ? "" : "Restoring saved session...";
     auth_state_ = AuthState::Login;
     auth_action_label_ = "SIGN IN";
     auth_switch_label_ = "New here? Create an account";
@@ -482,10 +500,15 @@ void ChatUI::DrainSocketEvents() {
     for (auto& event : events) {
         if (event.type == SocketEventType::Connected) {
             if (!auth_token_.empty()) {
-                websocket_->send(nlohmann::json{
+                auto result = websocket_->send(nlohmann::json{
                     {"type", "resume"},
                     {"token", auth_token_},
                 }.dump());
+                if (!result.success) {
+                    auth_token_.clear();
+                    auth_notice_.clear();
+                    auth_error_ = "Failed to restore the saved session";
+                }
             } else if (!pending_registration_username_.empty()) {
                 websocket_->send(nlohmann::json{
                     {"type", "registration_watch"},
@@ -529,6 +552,15 @@ void ChatUI::DrainSocketEvents() {
         }
 
         std::string type = payload.value("type", "");
+        if (type == "session_invalid") {
+            ResetAuthentication(
+                payload.value("message", "Session expired; sign in again"), true);
+            continue;
+        }
+        if (type == "logout_success") {
+            ResetAuthentication("Signed out", false);
+            continue;
+        }
         if (type == "error") {
             std::string error = payload.value("error", "Server error");
             if (auth_state_ == AuthState::LoggedIn) {
@@ -644,18 +676,27 @@ void ChatUI::DrainSocketEvents() {
             registration_request_in_flight_ = false;
             my_user_id_ = payload.value("user_id", int64_t{-1});
             my_name_ = payload.value("username", auth_username_);
+            auth_username_ = my_name_;
             auth_password_.clear();
             auth_state_ = AuthState::LoggedIn;
             websocket_authenticated_ = true;
             active_tab_index_ = 1;
             auth_error_.clear();
             auth_notice_.clear();
-            notification_.clear();
+            client_config_.username = my_name_;
+            client_config_.session_token = auth_token_;
+            std::string config_error;
+            notification_ = client_config_.Save(config_error)
+                ? ""
+                : "Logged in, but the session could not be saved: " + config_error;
             websocket_->send(nlohmann::json{{"type", "users"}}.dump());
             split_container_->TakeFocus();
             continue;
         }
         if (type == "users") {
+            if (auth_state_ != AuthState::LoggedIn || !websocket_authenticated_) {
+                continue;
+            }
             for (auto& contact : contacts_) {
                 contact.online = false;
             }
@@ -678,8 +719,14 @@ void ChatUI::DrainSocketEvents() {
             continue;
         }
         if (type == "chat") {
+            if (auth_state_ != AuthState::LoggedIn || !websocket_authenticated_) {
+                continue;
+            }
             int64_t sender_id = payload.value("sender_id", int64_t{-1});
             int64_t recipient_id = payload.value("recipient_id", int64_t{-1});
+            if (sender_id != my_user_id_ && recipient_id != my_user_id_) {
+                continue;
+            }
             const bool is_me = sender_id == my_user_id_;
             const int64_t contact_id = is_me ? recipient_id : sender_id;
             std::string contact_name = is_me
@@ -772,6 +819,59 @@ void ChatUI::SendMessage() {
             }
         }
     }
+}
+
+void ChatUI::SignOut() {
+    if (!websocket_connected_ || !websocket_authenticated_) {
+        ResetAuthentication("Signed out locally; the remote session will expire automatically", false);
+        return;
+    }
+    if (!websocket_->send(nlohmann::json{{"type", "logout"}}.dump()).success) {
+        notification_ = "Failed to send sign-out request";
+    }
+}
+
+void ChatUI::ResetAuthentication(const std::string& message, bool is_error) {
+    if (!my_name_.empty()) {
+        auth_username_ = my_name_;
+    }
+    auth_token_.clear();
+    pending_registration_username_.clear();
+    pending_registration_watch_token_.clear();
+    registration_request_username_.clear();
+    registration_request_watch_token_.clear();
+    registration_request_in_flight_ = false;
+    websocket_authenticated_ = false;
+    my_user_id_ = -1;
+    my_name_.clear();
+    contacts_.clear();
+    filtered_indices_.clear();
+    filtered_names_.clear();
+    selected_contact_index_ = 0;
+    editing_name_ = false;
+    search_query_.clear();
+    chat_input_text_.clear();
+    notification_.clear();
+    auth_password_.clear();
+    auth_state_ = AuthState::Login;
+    auth_action_label_ = "SIGN IN";
+    auth_switch_label_ = "New here? Create an account";
+    active_tab_index_ = 0;
+
+    client_config_.username = auth_username_;
+    client_config_.session_token.clear();
+    std::string config_error;
+    if (!client_config_.Save(config_error)) {
+        auth_error_ = "Unable to clear the saved session: " + config_error;
+        auth_notice_.clear();
+    } else if (is_error) {
+        auth_error_ = message;
+        auth_notice_.clear();
+    } else {
+        auth_error_.clear();
+        auth_notice_ = message;
+    }
+    login_password_input_->TakeFocus();
 }
 
 ftxui::Component ChatUI::GetComponent() {
@@ -881,6 +981,8 @@ ftxui::Component ChatUI::GetComponent() {
                 text(" USER: ") | bold | color(Color::Cyan),
                 editing_name_ ? my_name_input_->Render() : name_button_->Render(),
                 filler(),
+                sign_out_btn_->Render(),
+                text(" "),
                 chat_settings_btn_->Render(),
             }),
             separator(),

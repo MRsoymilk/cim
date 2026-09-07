@@ -44,6 +44,8 @@ ClientConfig ClientConfig::Load() {
         if (!host.empty() && port >= 1 && port <= 65535) {
             config.host = std::move(host);
             config.port = static_cast<uint16_t>(port);
+            config.username = document.value("username", "");
+            config.session_token = document.value("session_token", "");
         }
     } catch (const nlohmann::json::exception&) {
         return ClientConfig{};
@@ -55,16 +57,41 @@ bool ClientConfig::Save(std::string& error) const {
     try {
         const auto path = ConfigPath();
         std::filesystem::create_directories(path.parent_path());
+#ifndef _WIN32
+        {
+            std::ofstream create(path, std::ios::app);
+            if (!create) {
+                error = "Unable to create the configuration file";
+                return false;
+            }
+        }
+        std::filesystem::permissions(
+            path,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace);
+#endif
         std::ofstream output(path, std::ios::trunc);
         if (!output) {
             error = "Unable to open the configuration file";
             return false;
         }
-        output << nlohmann::json{{"host", host}, {"port", port}}.dump(2) << '\n';
+        output << nlohmann::json{
+            {"host", host},
+            {"port", port},
+            {"username", username},
+            {"session_token", session_token},
+        }.dump(2) << '\n';
         if (!output) {
             error = "Unable to write the configuration file";
             return false;
         }
+        output.close();
+#ifndef _WIN32
+        std::filesystem::permissions(
+            path,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace);
+#endif
         return true;
     } catch (const std::filesystem::filesystem_error& exception) {
         error = exception.what();

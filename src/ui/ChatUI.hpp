@@ -98,6 +98,7 @@ private:
     ftxui::Component switch_btn_;
     ftxui::Component login_settings_btn_;
     ftxui::Component chat_settings_btn_;
+    ftxui::Component sign_out_btn_;
     ftxui::Component settings_host_input_;
     ftxui::Component settings_port_input_;
     ftxui::Component settings_save_btn_;
@@ -133,6 +134,8 @@ private:
     void UpdateFilteredContacts();
     void MarkSelectedContactRead();
     void SendMessage();
+    void SignOut();
+    void ResetAuthentication(const std::string& message, bool is_error);
 };
 
 } // namespace cim

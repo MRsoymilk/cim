@@ -67,8 +67,12 @@ public:
 
     // Session operations
     bool createSession(const std::string& token, int64_t user_id, int64_t expires_at);
+    bool resumeSession(const std::string& token,
+                       int64_t expires_at,
+                       int64_t& user_id_out,
+                       std::string& username_out);
     bool getUserByToken(const std::string& token, int64_t& user_id_out, std::string& username_out);
-    void deleteSession(const std::string& token);
+    bool deleteSession(const std::string& token);
     void cleanupExpiredSessions();
 
 private:
