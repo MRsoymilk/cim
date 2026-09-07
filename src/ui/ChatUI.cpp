@@ -137,13 +137,7 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
         SaveSettings();
     }, primary_button);
     settings_back_btn_ = ftxui::Button("BACK", [this] {
-        settings_error_.clear();
-        active_tab_index_ = settings_return_tab_index_;
-        if (active_tab_index_ == 1) {
-            split_container_->TakeFocus();
-        } else {
-            login_container_->TakeFocus();
-        }
+        CloseSettings();
     }, secondary_button);
 
     login_container_ = ftxui::Container::Vertical({
@@ -284,6 +278,16 @@ void ChatUI::OpenSettings() {
     settings_error_.clear();
     active_tab_index_ = 2;
     settings_host_input_->TakeFocus();
+}
+
+void ChatUI::CloseSettings() {
+    settings_error_.clear();
+    active_tab_index_ = settings_return_tab_index_;
+    if (active_tab_index_ == 1) {
+        split_container_->TakeFocus();
+    } else {
+        login_container_->TakeFocus();
+    }
 }
 
 void ChatUI::SaveSettings() {
@@ -723,6 +727,23 @@ ftxui::Component ChatUI::GetComponent() {
         if (event == ftxui::Event::Custom) {
             DrainSocketEvents();
             return true;
+        }
+        if (event == ftxui::Event::Escape) {
+            if (active_tab_index_ == 2) {
+                CloseSettings();
+                return true;
+            }
+            if (auth_state_ == AuthState::LoggedIn && editing_name_) {
+                name_input_text_ = my_name_;
+                editing_name_ = false;
+                name_button_->TakeFocus();
+                return true;
+            }
+            if (auth_state_ == AuthState::LoggedIn && search_input_->Focused()) {
+                active_pane_ = 0;
+                contact_menu_->TakeFocus();
+                return true;
+            }
         }
         if (active_tab_index_ == 2) return false;
         if (auth_state_ != AuthState::LoggedIn) return false;

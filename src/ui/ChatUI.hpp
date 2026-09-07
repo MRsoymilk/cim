@@ -118,6 +118,7 @@ private:
 
     bool PerformAuth(bool is_register);
     void OpenSettings();
+    void CloseSettings();
     void SaveSettings();
     void ReconnectWebSocket();
     void ConnectWebSocket();
