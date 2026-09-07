@@ -5,7 +5,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <utility>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace cim {
 
@@ -27,6 +33,57 @@ std::filesystem::path ConfigPath() {
     return std::filesystem::current_path() / "cim-config.json";
 }
 
+std::filesystem::path ExecutableDirectory() {
+#ifdef _WIN32
+    std::vector<wchar_t> buffer(32768);
+    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length > 0 && length < buffer.size()) {
+        return std::filesystem::path(std::wstring(buffer.data(), length)).parent_path();
+    }
+#else
+    std::error_code error;
+    auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (!error && !executable.empty()) {
+        return executable.parent_path();
+    }
+#endif
+    return std::filesystem::current_path();
+}
+
+bool IsValidCaSource(const std::string& source) {
+    return source == "BUNDLED" || source == "SYSTEM" || source == "CUSTOM";
+}
+
+std::filesystem::path Utf8Path(const std::string& value) {
+    return std::filesystem::path(std::u8string(
+        reinterpret_cast<const char8_t*>(value.data()),
+        reinterpret_cast<const char8_t*>(value.data() + value.size())));
+}
+
+std::string ReadCertificate(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        return {};
+    }
+    input.seekg(0, std::ios::end);
+    const auto size = input.tellg();
+    constexpr std::streamoff kMaximumCaBytes = 4 * 1024 * 1024;
+    if (size <= 0 || size > kMaximumCaBytes) {
+        return {};
+    }
+    input.seekg(0, std::ios::beg);
+    std::string certificate(static_cast<size_t>(size), '\0');
+    if (!input.read(certificate.data(), size)) {
+        return {};
+    }
+    if (certificate.find("-----BEGIN CERTIFICATE-----") == std::string::npos ||
+        certificate.find("PRIVATE KEY") != std::string::npos ||
+        certificate == "NONE" || certificate == "SYSTEM") {
+        return {};
+    }
+    return certificate;
+}
+
 } // namespace
 
 ClientConfig ClientConfig::Load() {
@@ -44,6 +101,17 @@ ClientConfig ClientConfig::Load() {
         if (!host.empty() && port >= 1 && port <= 65535) {
             config.host = std::move(host);
             config.port = static_cast<uint16_t>(port);
+            const std::string ca_source = document.value("ca_source", config.ca_source);
+            if (IsValidCaSource(ca_source)) {
+                config.ca_source = ca_source;
+                config.custom_ca_path = document.value("custom_ca_path", "");
+                if (config.ca_source == "CUSTOM" &&
+                    (config.custom_ca_path.empty() || config.custom_ca_path == "NONE" ||
+                     config.custom_ca_path == "SYSTEM")) {
+                    config.ca_source = "BUNDLED";
+                    config.custom_ca_path.clear();
+                }
+            }
             config.username = document.value("username", "");
             config.session_token = document.value("session_token", "");
         }
@@ -78,6 +146,8 @@ bool ClientConfig::Save(std::string& error) const {
         output << nlohmann::json{
             {"host", host},
             {"port", port},
+            {"ca_source", ca_source},
+            {"custom_ca_path", custom_ca_path},
             {"username", username},
             {"session_token", session_token},
         }.dump(2) << '\n';
@@ -105,7 +175,18 @@ std::string ClientConfig::WebSocketUrl() const {
         !(host.starts_with('[') && host.ends_with(']'))) {
         url_host = '[' + host + ']';
     }
-    return "ws://" + url_host + ':' + std::to_string(port);
+    return "wss://" + url_host + ':' + std::to_string(port);
+}
+
+std::string ClientConfig::TrustedCaData() const {
+    if (ca_source == "SYSTEM") {
+        return "SYSTEM";
+    }
+    if (ca_source == "CUSTOM" && !custom_ca_path.empty() &&
+        custom_ca_path != "NONE" && custom_ca_path != "SYSTEM") {
+        return ReadCertificate(Utf8Path(custom_ca_path));
+    }
+    return ReadCertificate(ExecutableDirectory() / "cim-ca.crt");
 }
 
 } // namespace cim

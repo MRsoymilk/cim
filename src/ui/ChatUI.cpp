@@ -3,6 +3,7 @@
 #include "ftxui/component/event.hpp"
 #include "ftxui/component/component.hpp"
 #include <ixwebsocket/IXNetSystem.h>
+#include <ixwebsocket/IXSocketTLSOptions.h>
 #include <ixwebsocket/IXWebSocket.h>
 #include <nlohmann/json.hpp>
 #include <sodium.h>
@@ -10,6 +11,7 @@
 #include <charconv>
 #include <cctype>
 #include <ctime>
+#include <filesystem>
 #include <iomanip>
 #include <iterator>
 #include <sstream>
@@ -18,6 +20,11 @@
 namespace cim {
 
 namespace {
+
+constexpr const char* kSecureCipherSuites =
+    "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+    "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+    "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
 
 std::string FormatTimestamp(int64_t timestamp) {
     if (timestamp <= 0) {
@@ -47,6 +54,12 @@ std::string Trim(std::string value) {
     value.erase(value.begin(), std::find_if(value.begin(), value.end(), is_not_space));
     value.erase(std::find_if(value.rbegin(), value.rend(), is_not_space).base(), value.end());
     return value;
+}
+
+std::filesystem::path Utf8Path(const std::string& value) {
+    return std::filesystem::path(std::u8string(
+        reinterpret_cast<const char8_t*>(value.data()),
+        reinterpret_cast<const char8_t*>(value.data() + value.size())));
 }
 
 bool EqualUsernames(const std::string& left, const std::string& right) {
@@ -162,6 +175,10 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
     settings_host_input_ = ftxui::Input(
         &settings_host_, "127.0.0.1 or server.example.com", settings_input_option);
     settings_port_input_ = ftxui::Input(&settings_port_, "9001", settings_input_option);
+    settings_ca_source_toggle_ = ftxui::Toggle(
+        &settings_ca_sources_, &settings_ca_source_index_);
+    settings_custom_ca_input_ = ftxui::Input(
+        &settings_custom_ca_path_, "/path/to/ca.crt", settings_input_option);
 
     settings_save_btn_ = ftxui::Button("SAVE & RECONNECT", [this] {
         SaveSettings();
@@ -181,6 +198,8 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
     settings_container_ = ftxui::Container::Vertical({
         settings_host_input_,
         settings_port_input_,
+        settings_ca_source_toggle_,
+        settings_custom_ca_input_,
         settings_save_btn_,
         settings_back_btn_,
     });
@@ -360,6 +379,12 @@ void ChatUI::OpenSettings() {
     settings_return_tab_index_ = active_tab_index_;
     settings_host_ = client_config_.host;
     settings_port_ = std::to_string(client_config_.port);
+    auto ca_source = std::find(
+        settings_ca_sources_.begin(), settings_ca_sources_.end(), client_config_.ca_source);
+    settings_ca_source_index_ = ca_source == settings_ca_sources_.end()
+        ? 0
+        : static_cast<int>(std::distance(settings_ca_sources_.begin(), ca_source));
+    settings_custom_ca_path_ = client_config_.custom_ca_path;
     settings_error_.clear();
     active_tab_index_ = 2;
     settings_host_input_->TakeFocus();
@@ -399,8 +424,40 @@ void ChatUI::SaveSettings() {
         return;
     }
 
-    ClientConfig updated{host, static_cast<uint16_t>(port)};
-    if (updated.host == client_config_.host && updated.port == client_config_.port) {
+    if (settings_ca_source_index_ < 0 ||
+        settings_ca_source_index_ >= static_cast<int>(settings_ca_sources_.size())) {
+        settings_error_ = "Select a certificate authority source";
+        return;
+    }
+    const std::string ca_source = settings_ca_sources_[settings_ca_source_index_];
+    std::string custom_ca_path = Trim(settings_custom_ca_path_);
+    if (ca_source == "CUSTOM") {
+        if (custom_ca_path.empty() || custom_ca_path == "NONE" || custom_ca_path == "SYSTEM") {
+            settings_error_ = "Enter a custom CA certificate file path";
+            return;
+        }
+        std::error_code path_error;
+        auto absolute_path = std::filesystem::absolute(
+            Utf8Path(custom_ca_path), path_error);
+        if (path_error || !std::filesystem::is_regular_file(absolute_path, path_error) || path_error) {
+            settings_error_ = "Custom CA certificate is not a readable file";
+            return;
+        }
+        const auto utf8_path = absolute_path.u8string();
+        custom_ca_path.assign(
+            reinterpret_cast<const char*>(utf8_path.data()), utf8_path.size());
+    }
+
+    ClientConfig updated;
+    updated.host = host;
+    updated.port = static_cast<uint16_t>(port);
+    updated.ca_source = ca_source;
+    updated.custom_ca_path = custom_ca_path;
+    const bool same_ca = updated.ca_source == client_config_.ca_source &&
+        (updated.ca_source != "CUSTOM" ||
+         updated.custom_ca_path == client_config_.custom_ca_path);
+    if (updated.host == client_config_.host && updated.port == client_config_.port &&
+        same_ca) {
         updated.username = client_config_.username;
         updated.session_token = client_config_.session_token;
     }
@@ -452,6 +509,11 @@ void ChatUI::ReconnectWebSocket() {
 
 void ChatUI::ConnectWebSocket() {
     websocket_->setUrl(client_config_.WebSocketUrl());
+    ix::SocketTLSOptions tls_options;
+    tls_options.caFile = client_config_.TrustedCaData();
+    tls_options.ciphers = kSecureCipherSuites;
+    tls_options.disable_hostname_validation = false;
+    websocket_->setTLSOptions(tls_options);
     websocket_->setPingInterval(30);
     websocket_->setOnMessageCallback([this](const ix::WebSocketMessagePtr& message) {
         SocketEvent event;
@@ -893,12 +955,28 @@ ftxui::Component ChatUI::GetComponent() {
                     settings_port_input_->Render() | flex,
                 }) | borderLight,
             });
+            auto ca_source_field = vbox(Elements{
+                text("TRUSTED CA") | color(Color::GrayDark),
+                settings_ca_source_toggle_->Render() | borderLight,
+            });
+            auto custom_ca_field = vbox(Elements{
+                text("CUSTOM CA CERTIFICATE") | color(Color::GrayDark),
+                hbox(Elements{
+                    text(" > ") | bold | color(Color::Cyan),
+                    settings_custom_ca_input_->Render() | flex,
+                }) | borderLight,
+            });
+            const std::string connection_error = !settings_error_.empty()
+                ? settings_error_
+                : (!websocket_connected_ ? auth_error_ : "");
             auto status = websocket_connected_
                 ? text("CONNECTED") | bold | color(Color::Green)
-                : text("CONNECTING...") | color(Color::Yellow);
-            auto error = settings_error_.empty()
+                : connection_error.empty()
+                    ? text("CONNECTING...") | color(Color::Yellow)
+                    : text("CONNECTION ERROR") | bold | color(Color::RedLight);
+            auto error = connection_error.empty()
                 ? text(" ")
-                : text("! " + settings_error_) | bold | color(Color::RedLight);
+                : paragraph("! " + connection_error) | bold | color(Color::RedLight);
 
             auto card = vbox(Elements{
                 text("SERVER SETTINGS") | bold | color(Color::Cyan) | center,
@@ -915,11 +993,15 @@ ftxui::Component ChatUI::GetComponent() {
                 host_field,
                 text(" "),
                 port_field,
+                text(" "),
+                ca_source_field,
+                text(" "),
+                custom_ca_field,
                 error | center,
                 settings_save_btn_->Render() | size(WIDTH, EQUAL, 48) | hcenter,
                 text(" "),
                 settings_back_btn_->Render() | center,
-            }) | size(WIDTH, EQUAL, 56) | borderRounded;
+            }) | size(WIDTH, EQUAL, 68) | borderRounded;
 
             return card | center;
         }

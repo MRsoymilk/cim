@@ -22,5 +22,6 @@ target_link_libraries(cim-server PRIVATE
     ixwebsocket::ixwebsocket
     ${CIM_SQLITE_TARGET}
     ${CIM_SODIUM_TARGET}
+    OpenSSL::SSL
 )
 target_compile_features(cim-server PRIVATE cxx_std_20)

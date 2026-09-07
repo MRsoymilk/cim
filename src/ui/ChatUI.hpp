@@ -86,6 +86,9 @@ private:
     ClientConfig client_config_;
     std::string settings_host_;
     std::string settings_port_;
+    std::vector<std::string> settings_ca_sources_{"BUNDLED", "SYSTEM", "CUSTOM"};
+    int settings_ca_source_index_ = 0;
+    std::string settings_custom_ca_path_;
     std::string settings_error_;
     int settings_return_tab_index_ = 0;
 
@@ -101,6 +104,8 @@ private:
     ftxui::Component sign_out_btn_;
     ftxui::Component settings_host_input_;
     ftxui::Component settings_port_input_;
+    ftxui::Component settings_ca_source_toggle_;
+    ftxui::Component settings_custom_ca_input_;
     ftxui::Component settings_save_btn_;
     ftxui::Component settings_back_btn_;
     ftxui::Component my_name_input_;

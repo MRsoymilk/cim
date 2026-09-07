@@ -102,6 +102,8 @@ std::string FormatTime(int64_t timestamp) {
 void PrintHelp() {
     std::cout
         << "cim-server management commands:\n"
+        << "  cim-server --tls-cert <PEM> --tls-key <PEM>\n"
+        << "                                  Start the secure chat server\n"
         << "  cim-server users              List registered users and status\n"
         << "  cim-server pending            List registration requests\n"
         << "  cim-server approve <username> Approve a registration request\n"

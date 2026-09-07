@@ -18,6 +18,7 @@
 - **消息时间标记**：每条消息上方显示服务端确认的发送日期和时间。
 - **在线状态同步**：联系人列表会显示用户当前处于在线或离线状态。
 - **服务器连接设置**：可在客户端配置服务器的 IP、域名和端口，保存后自动重新连接。
+- **加密传输**：聊天通道强制使用 WSS，并校验服务器证书及主机名。
 - **联系人搜索**：通过用户名快速筛选联系人。
 - **双栏聊天界面**：左侧管理联系人，右侧集中展示当前会话和消息输入框。
 - **键盘优先操作**：支持方向键切换区域和联系人，按 Enter 发送消息。
@@ -34,6 +35,7 @@
 - 支持 C++20 的编译器
 - SQLite3
 - libsodium
+- OpenSSL
 
 获取源码后，先初始化项目依赖：
 
@@ -47,13 +49,13 @@ Debian / Ubuntu 可以通过以下命令安装构建环境：
 
 ```bash
 sudo apt update
-sudo apt install build-essential cmake git libsqlite3-dev libsodium-dev
+sudo apt install build-essential cmake git libsqlite3-dev libsodium-dev libssl-dev
 ```
 
-配置并构建：
+先按照下一节生成证书，再把 CA 公共证书路径传给 CMake：
 
 ```bash
-cmake -B build -S .
+cmake -B build -S . -DCIM_CA_CERT="$HOME/.local/share/cim/tls/ca.crt"
 cmake --build build --target all
 ```
 
@@ -70,14 +72,15 @@ Windows 需要 Visual Studio 2022 的“使用 C++ 的桌面开发”组件，�
 [vcpkg](https://github.com/microsoft/vcpkg) 安装系统依赖：
 
 ```powershell
-C:\vcpkg\vcpkg.exe install sqlite3:x64-windows libsodium:x64-windows
+C:\vcpkg\vcpkg.exe install sqlite3:x64-windows libsodium:x64-windows openssl:x64-windows
 ```
 
 通过 vcpkg 工具链配置并构建 Release 版本：
 
 ```powershell
 cmake -B build -S . -A x64 `
-  -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+  -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+  -DCIM_CA_CERT=C:/secure/cim/ca.crt
 cmake --build build --config Release --target all
 ```
 
@@ -85,10 +88,67 @@ cmake --build build --config Release --target all
 
 ```text
 build/Release/cim.exe
+build/Release/cim-ca.crt
 build/Release/cim-server.exe
 ```
 
-> Linux 构建已经验证。Windows 构建配置已适配 vcpkg，但尚未在 MSVC 环境中实际验证。
+> Linux 构建已经验证。Windows 构建配置已适配 vcpkg，但尚未在 MSVC 环境中实际验证。Windows 上的证书可在可信的 Linux 管理机生成后传入构建。
+
+## TLS 证书
+
+项目使用私有 CA 签发服务器证书。客户端仅携带公开的 `ca.crt`，不得分发 `ca.key` 或 `server.key`。证书输出目录应位于源码仓库之外。
+
+为服务器的实际域名和 IP 生成证书，`--dns` 和 `--ip` 均可重复：
+
+```bash
+./scripts/generate-tls-cert.sh \
+  --output-dir "$HOME/.local/share/cim/tls" \
+  --dns chat.example.com \
+  --ip 203.0.113.10
+```
+
+如果客户端使用 `127.0.0.1` 连接，证书必须包含对应 SAN：
+
+```bash
+./scripts/generate-tls-cert.sh \
+  --output-dir "$HOME/.local/share/cim/tls" \
+  --dns localhost \
+  --ip 127.0.0.1
+```
+
+脚本生成以下文件：
+
+```text
+ca.crt              客户端信任的 CA 公共证书
+ca.key              CA 私钥，仅管理员保存
+server.crt          服务器证书
+server.key          服务器私钥
+server-chain.crt    服务端使用的完整证书链
+```
+
+续期会保留原 CA，因此不需要重新分发客户端：
+
+```bash
+./scripts/generate-tls-cert.sh \
+  --output-dir "$HOME/.local/share/cim/tls" \
+  --dns chat.example.com \
+  --ip 203.0.113.10 \
+  --renew
+```
+
+续期后需要重启 `cim-server` 才会加载新证书。新增域名或 IP 时，必须在续期命令中再次列出全部仍需保留的 SAN。
+
+构建会把 CA 公共证书复制到 `cim` 可执行文件旁并命名为 `cim-ca.crt`。发布客户端时必须同时分发这两个文件。客户端 Settings 中可改用系统 CA 或指定其他 CA PEM，但不能关闭证书与主机名校验。
+
+从保存 `cim.db` 的工作目录启动服务端：
+
+```bash
+./build/cim-server \
+  --tls-cert "$HOME/.local/share/cim/tls/server-chain.crt" \
+  --tls-key "$HOME/.local/share/cim/tls/server.key"
+```
+
+证书应由运行服务端的非 root 专用账户生成和读取；不要仅为读取 root 所有的私钥而以 root 运行服务端。服务端没有证书参数时会拒绝启动。聊天端口 `9001` 仅接受 WSS；本机管理端口 `127.0.0.1:9002` 不暴露到网络，继续使用受 `cim-admin.key` 保护的本机 WebSocket。
 
 ## 服务端管理
 
@@ -146,7 +206,7 @@ build/Release/cim-server.exe
 
 ## 使用体验
 
-1. 打开 cim 后，可以通过 `Server settings` 配置服务器地址和端口。
+1. 确保 `cim-ca.crt` 位于客户端可执行文件旁，再打开 cim；可以通过 `Server settings` 配置服务器地址、端口和 CA 来源。
 2. 选择登录或提交账号注册申请；新账号需要等待服务端管理员批准。
 3. 登录成功后，从左侧联系人列表选择聊天对象。
 4. 在右侧输入消息，按 Enter 发送。
@@ -160,5 +220,5 @@ build/Release/cim-server.exe
 - 聊天消息不会保存为历史记录。
 - 对方离线时不会保存或补发消息。
 - 登录 session 使用 30 天滚动有效期；改密、删号或主动退出会立即撤销对应 session。
-- 当前 WebSocket 连接未启用 TLS。不要在不可信网络上直接传输账号密码或长期 session token。
+- 客户端到服务器使用 TLS 加密，但聊天不是端到端加密，服务端仍可读取在线转发的消息。
 - 群聊、文件传输、图片消息和消息撤回尚未提供。
