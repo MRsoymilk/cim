@@ -27,6 +27,7 @@ struct Contact {
     int64_t id;
     std::string name;
     bool online;
+    bool unread;
     std::vector<ChatMessage> messages;
 };
 
@@ -124,6 +125,7 @@ private:
     void ConnectWebSocket();
     void DrainSocketEvents();
     void UpdateFilteredContacts();
+    void MarkSelectedContactRead();
     void SendMessage();
 };
 

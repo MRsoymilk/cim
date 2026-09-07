@@ -168,6 +168,7 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
     search_option.multiline = false;
     search_option.on_change = [this] {
         UpdateFilteredContacts();
+        MarkSelectedContactRead();
     };
     search_input_ = ftxui::Input(&search_query_, "Search contacts...", search_option);
 
@@ -194,19 +195,34 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
     );
 
     ftxui::MenuOption menu_option;
-    menu_option.entries_option.transform = [](const ftxui::EntryState& s) {
+    menu_option.entries_option.transform = [this](const ftxui::EntryState& s) {
         auto element = ftxui::text(" " + s.label + " ");
+        bool unread = false;
+        if (s.index >= 0 && s.index < static_cast<int>(filtered_indices_.size())) {
+            const int contact_index = filtered_indices_[s.index];
+            unread = contact_index >= 0 &&
+                contact_index < static_cast<int>(contacts_.size()) &&
+                contacts_[contact_index].unread;
+        }
         if (s.active && s.focused) {
             element = element |
                 ftxui::bold |
                 ftxui::color(ftxui::Color::Black) |
                 ftxui::bgcolor(ftxui::Color::Cyan);
+        } else if (unread) {
+            element = element | ftxui::bold | ftxui::color(ftxui::Color::MagentaLight);
         } else if (s.active) {
             element = element | ftxui::bold | ftxui::color(ftxui::Color::Cyan);
         } else {
             element = element | ftxui::color(ftxui::Color::White);
         }
+        if (unread) {
+            element = element | ftxui::blink;
+        }
         return element;
+    };
+    menu_option.on_change = [this] {
+        MarkSelectedContactRead();
     };
 
     contact_menu_ = ftxui::Menu(&filtered_names_, &selected_contact_index_, menu_option);
@@ -287,6 +303,7 @@ void ChatUI::CloseSettings() {
     settings_error_.clear();
     active_tab_index_ = settings_return_tab_index_;
     if (active_tab_index_ == 1) {
+        MarkSelectedContactRead();
         split_container_->TakeFocus();
     } else {
         login_container_->TakeFocus();
@@ -476,7 +493,7 @@ void ChatUI::DrainSocketEvents() {
                     return item.id == user_id;
                 });
                 if (contact == contacts_.end()) {
-                    contacts_.push_back({user_id, username, user.value("online", false), {}});
+                    contacts_.push_back({user_id, username, user.value("online", false), false, {}});
                 } else {
                     contact->name = username;
                     contact->online = user.value("online", false);
@@ -496,8 +513,16 @@ void ChatUI::DrainSocketEvents() {
                 return item.id == contact_id;
             });
             if (contact == contacts_.end()) {
-                contacts_.push_back({contact_id, contact_name, true, {}});
+                contacts_.push_back({contact_id, contact_name, true, false, {}});
                 contact = std::prev(contacts_.end());
+            }
+            const bool selected_contact_is_visible =
+                active_tab_index_ == 1 &&
+                selected_contact_index_ >= 0 &&
+                selected_contact_index_ < static_cast<int>(filtered_indices_.size()) &&
+                contacts_[filtered_indices_[selected_contact_index_]].id == contact_id;
+            if (!is_me && !selected_contact_is_visible) {
+                contact->unread = true;
             }
             contact->messages.push_back({
                 is_me,
@@ -507,18 +532,44 @@ void ChatUI::DrainSocketEvents() {
         }
     }
     UpdateFilteredContacts();
+    MarkSelectedContactRead();
 }
 
 void ChatUI::UpdateFilteredContacts() {
     filtered_indices_.clear();
     filtered_names_.clear();
     for (size_t i = 0; i < contacts_.size(); ++i) {
-        std::string display_name = contacts_[i].name + (contacts_[i].online ? " [Online]" : " [Offline]");
+        std::string display_name = contacts_[i].name;
+        if (contacts_[i].unread) {
+            display_name += " [NEW]";
+        }
+        display_name += (contacts_[i].online ? " [Online]" : " [Offline]");
         if (search_query_.empty() || contacts_[i].name.find(search_query_) != std::string::npos) {
             filtered_indices_.push_back(i);
             filtered_names_.push_back(display_name);
         }
     }
+    if (filtered_names_.empty()) {
+        selected_contact_index_ = -1;
+    } else {
+        selected_contact_index_ = std::clamp(
+            selected_contact_index_, 0, static_cast<int>(filtered_names_.size()) - 1);
+    }
+}
+
+void ChatUI::MarkSelectedContactRead() {
+    if (active_tab_index_ != 1 ||
+        selected_contact_index_ < 0 ||
+        selected_contact_index_ >= static_cast<int>(filtered_indices_.size())) {
+        return;
+    }
+
+    const int contact_index = filtered_indices_[selected_contact_index_];
+    if (!contacts_[contact_index].unread) {
+        return;
+    }
+    contacts_[contact_index].unread = false;
+    UpdateFilteredContacts();
 }
 
 void ChatUI::SendMessage() {
