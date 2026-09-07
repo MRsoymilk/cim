@@ -183,7 +183,7 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
             opt.transform = [](const ftxui::EntryState& s) {
                 auto element = ftxui::text(s.label);
                 if (s.focused) {
-                    element = element | ftxui::bold | ftxui::color(ftxui::Color::Yellow);
+                    element = element | ftxui::bold | ftxui::color(ftxui::Color::Cyan);
                 } else {
                     element = element | ftxui::color(ftxui::Color::Green);
                 }
@@ -196,9 +196,12 @@ ChatUI::ChatUI(ftxui::Closure request_refresh)
     ftxui::MenuOption menu_option;
     menu_option.entries_option.transform = [](const ftxui::EntryState& s) {
         auto element = ftxui::text(" " + s.label + " ");
-        if (s.active) {
-            element = element | ftxui::bold | ftxui::color(ftxui::Color::Yellow) | ftxui::inverted;
-        } else if (s.focused) {
+        if (s.active && s.focused) {
+            element = element |
+                ftxui::bold |
+                ftxui::color(ftxui::Color::Black) |
+                ftxui::bgcolor(ftxui::Color::Cyan);
+        } else if (s.active) {
             element = element | ftxui::bold | ftxui::color(ftxui::Color::Cyan);
         } else {
             element = element | ftxui::color(ftxui::Color::White);
