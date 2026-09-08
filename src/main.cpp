@@ -1,6 +1,6 @@
 #include "ftxui/component/screen_interactive.hpp"
 #include "ftxui/component/event.hpp"
-#include "ui/ChatUI.hpp"
+#include "ui/chat/ChatUI.hpp"
 #include <sodium.h>
 
 int main() {

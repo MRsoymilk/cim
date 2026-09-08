@@ -1,41 +1,15 @@
 #pragma once
 
-#include "ClientConfig.hpp"
+#include "config/ClientConfig.hpp"
+#include "net/ClientConnection.hpp"
+#include "ui/chat/ChatTypes.hpp"
 #include "ftxui/component/component.hpp"
 #include "ftxui/component/task.hpp"
-#include <atomic>
 #include <string>
 #include <vector>
 #include <cstdint>
-#include <deque>
-#include <memory>
-#include <mutex>
-
-namespace ix {
-class WebSocket;
-}
 
 namespace cim {
-
-struct ChatMessage {
-    bool is_me;
-    std::string content;
-    int64_t sent_at;
-};
-
-struct Contact {
-    int64_t id;
-    std::string name;
-    bool online;
-    bool unread;
-    std::vector<ChatMessage> messages;
-};
-
-enum class AuthState {
-    Login,
-    Register,
-    LoggedIn
-};
 
 class ChatUI {
 public:
@@ -44,19 +18,7 @@ public:
     ftxui::Component GetComponent();
 
 private:
-    enum class SocketEventType {
-        Connected,
-        Disconnected,
-        Message,
-        Error
-    };
-
-    struct SocketEvent {
-        SocketEventType type;
-        std::string content;
-    };
-
-    ftxui::Closure request_refresh_;
+    ClientConnection connection_;
     AuthState auth_state_ = AuthState::Login;
     std::string auth_username_ = "";
     std::string auth_password_ = "";
@@ -122,12 +84,6 @@ private:
 
     std::vector<int> filtered_indices_;
     std::vector<std::string> filtered_names_;
-
-    std::unique_ptr<ix::WebSocket> websocket_;
-    std::atomic<bool> websocket_connected_ = false;
-    std::atomic<bool> websocket_authenticated_ = false;
-    std::mutex socket_events_mutex_;
-    std::deque<SocketEvent> socket_events_;
 
     bool PerformAuth(bool is_register);
     void OpenSettings();

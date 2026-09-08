@@ -81,8 +81,14 @@ endif()
 
 add_executable(cim 
     src/main.cpp
-    src/ClientConfig.cpp
-    src/ui/ChatUI.cpp
+    src/config/ClientConfig.cpp
+    src/net/ClientConnection.cpp
+    src/ui/chat/ChatUI.cpp
+    src/ui/chat/ChatUIAuth.cpp
+    src/ui/chat/ChatUISettings.cpp
+    src/ui/chat/ChatUIProtocol.cpp
+    src/ui/chat/ChatUIContacts.cpp
+    src/ui/chat/ChatUIRender.cpp
 )
 
 target_include_directories(cim PRIVATE src vendor/nlohmann_json/single_include)

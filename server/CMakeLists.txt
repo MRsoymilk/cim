@@ -14,8 +14,17 @@ else()
     endif()
 endif()
 
-add_executable(cim-server main.cpp Database.cpp AdminCLI.cpp)
+add_executable(cim-server
+    main.cpp
+    admin/AdminCLI.cpp
+    config/ServerOptions.cpp
+    core/CimServer.cpp
+    protocol/AdminHandler.cpp
+    protocol/ClientHandler.cpp
+    storage/Database.cpp
+)
 target_include_directories(cim-server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/vendor/nlohmann_json/single_include
 )
 target_link_libraries(cim-server PRIVATE

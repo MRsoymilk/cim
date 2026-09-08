@@ -1,4 +1,4 @@
-#include "ClientConfig.hpp"
+#include "config/ClientConfig.hpp"
 
 #include <nlohmann/json.hpp>
 
