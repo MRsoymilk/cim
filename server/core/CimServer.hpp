@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -22,7 +23,7 @@ public:
     ~CimServer();
 
     bool Initialize();
-    int Run();
+    int Run(const std::function<bool()>& stop_requested);
 
 private:
     struct Session {

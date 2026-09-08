@@ -4,3 +4,4 @@ cim-admin.key
 cim-config.json
 cim.db
 tls/
+docker-data/

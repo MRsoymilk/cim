@@ -1,0 +1,10 @@
+.git
+.gitignore
+build
+build-*
+cmake-build-*
+cim-admin.key
+cim.db
+docker-data
+tls
+*.log

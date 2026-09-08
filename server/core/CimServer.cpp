@@ -6,10 +6,12 @@
 #include <sodium.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
@@ -80,13 +82,19 @@ bool CimServer::Initialize() {
     return true;
 }
 
-int CimServer::Run() {
+int CimServer::Run(const std::function<bool()>& stop_requested) {
     std::cout << "[cim-server] Secure WebSocket server listening on port 9001" << std::endl;
     std::cout << "[Admin] Local management listening on 127.0.0.1:9002" << std::endl;
     public_server_->start();
     admin_server_->start();
-    public_server_->wait();
+
+    while (!stop_requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    std::cout << "[cim-server] Shutting down" << std::endl;
     admin_server_->stop();
+    public_server_->stop();
     return 0;
 }
 

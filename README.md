@@ -150,6 +150,50 @@ server-chain.crt    服务端使用的完整证书链
 
 证书应由运行服务端的非 root 专用账户生成和读取；不要仅为读取 root 所有的私钥而以 root 运行服务端。服务端没有证书参数时会拒绝启动。聊天端口 `9001` 仅接受 WSS；本机管理端口 `127.0.0.1:9002` 不暴露到网络，继续使用受 `cim-admin.key` 保护的本机 WebSocket。
 
+## Docker 部署
+
+`Dockerfile` 使用多阶段构建，并通过 `CIM_BUILD_CLIENT=OFF` 只构建服务端。运行阶段使用非 root 用户和只读根文件系统；镜像不包含证书、私钥、数据库或管理密钥。
+
+准备持久化目录并设置当前宿主用户身份：
+
+```bash
+mkdir -p docker-data
+chmod 700 docker-data
+export CIM_UID="$(id -u)"
+export CIM_GID="$(id -g)"
+export CIM_DATA_DIR="$PWD/docker-data"
+export CIM_TLS_DIR="$HOME/.local/share/cim/tls"
+chmod 600 "$CIM_TLS_DIR/server.key"
+```
+
+`CIM_TLS_DIR` 必须包含 `server-chain.crt` 和 `server.key`。Compose 只挂载这两个文件，不会把 `ca.key` 放入容器。证书和数据目录必须能被 `CIM_UID:CIM_GID` 读取或写入。
+
+构建并启动：
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs -f cim-server
+```
+
+主机端口默认为 `9001`，可以在启动前通过 `CIM_PORT` 修改。管理端口 `9002` 不会映射到宿主机，管理命令应在容器内部执行：
+
+```bash
+docker compose exec cim-server /app/cim-server pending
+docker compose exec cim-server /app/cim-server users
+docker compose exec cim-server /app/cim-server approve <username>
+```
+
+`cim.db` 和 `cim-admin.key` 保存在 `CIM_DATA_DIR`。迁移已有服务时，应先停止原服务，再把这两个文件复制到数据目录并保持所有者为 `CIM_UID:CIM_GID`。不要同时运行共享同一个数据库的本机服务和容器服务。
+
+证书续期后重启容器：
+
+```bash
+docker compose restart cim-server
+```
+
+容器收到 `SIGTERM` 后会停止接受连接、关闭 WebSocket 并正常退出。健康检查通过容器内部的本机管理通道执行 `cim-server users`。
+
 ## 服务端管理
 
 管理命令要求 `cim-server` 正在运行，并且必须在启动服务端时使用的同一工作目录执行。服务端首次启动时会在该目录生成 `cim-admin.key`，管理通道仅监听 `127.0.0.1:9002`。

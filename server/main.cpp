@@ -5,8 +5,19 @@
 #include <ixwebsocket/IXNetSystem.h>
 #include <sodium.h>
 
+#include <csignal>
 #include <iostream>
 #include <utility>
+
+namespace {
+
+volatile std::sig_atomic_t shutdown_requested = 0;
+
+void HandleShutdownSignal(int) {
+    shutdown_requested = 1;
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     if (cim::IsAdminCommand(argc, argv)) {
@@ -31,7 +42,12 @@ int main(int argc, char** argv) {
     {
         cim::CimServer server(std::move(options));
         if (server.Initialize()) {
-            result = server.Run();
+            if (std::signal(SIGINT, HandleShutdownSignal) == SIG_ERR ||
+                std::signal(SIGTERM, HandleShutdownSignal) == SIG_ERR) {
+                std::cerr << "[Server] Failed to install shutdown signal handlers" << std::endl;
+            } else {
+                result = server.Run([] { return shutdown_requested != 0; });
+            }
         }
     }
     ix::uninitNetSystem();

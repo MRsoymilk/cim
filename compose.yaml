@@ -1,0 +1,36 @@
+services:
+  cim-server:
+    build:
+      context: .
+      target: runtime
+    image: cim-server:local
+    init: true
+    user: "${CIM_UID:-1000}:${CIM_GID:-1000}"
+    command:
+      - --tls-cert
+      - /certs/server-chain.crt
+      - --tls-key
+      - /certs/server.key
+    ports:
+      - "${CIM_PORT:-9001}:9001"
+    volumes:
+      - type: bind
+        source: ${CIM_DATA_DIR:-./docker-data}
+        target: /data
+      - type: bind
+        source: ${CIM_TLS_DIR:?Set CIM_TLS_DIR to the server certificate directory}/server-chain.crt
+        target: /certs/server-chain.crt
+        read_only: true
+      - type: bind
+        source: ${CIM_TLS_DIR:?Set CIM_TLS_DIR to the server certificate directory}/server.key
+        target: /certs/server.key
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    stop_grace_period: 15s
