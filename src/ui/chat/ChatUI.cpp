@@ -2,19 +2,27 @@
 #include "ftxui/component/component.hpp"
 #include "ftxui/dom/elements.hpp"
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <utility>
 
 namespace cim {
 
 ChatUI::ChatUI(ftxui::Closure request_refresh, std::string trusted_ca_override)
-    : connection_(std::move(request_refresh)),
+    : connection_(request_refresh),
+      render_timer_([this, request_refresh](std::stop_token stop_token) {
+          while (!stop_token.stop_requested()) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(150));
+              if (!stop_token.stop_requested() && animate_auth_status_.load()) {
+                  request_refresh();
+              }
+          }
+      }),
       trusted_ca_override_(std::move(trusted_ca_override)) {
     client_config_ = ClientConfig::Load();
     auth_username_ = client_config_.username;
-    auth_token_ = client_config_.session_token;
-    if (!auth_token_.empty()) {
-        auth_notice_ = "Restoring saved session...";
-    }
+    remember_password_ = client_config_.remember_password;
+    auth_password_ = remember_password_ ? client_config_.password : "";
     settings_host_ = client_config_.host;
     settings_port_ = std::to_string(client_config_.port);
 
@@ -36,6 +44,8 @@ ChatUI::ChatUI(ftxui::Closure request_refresh, std::string trusted_ca_override)
     pass_option.password = true;
     pass_option.transform = user_option.transform;
     login_password_input_ = ftxui::Input(&auth_password_, "Password", pass_option);
+    remember_password_checkbox_ = ftxui::Checkbox(
+        "Remember password", &remember_password_);
 
     auto primary_button = ftxui::ButtonOption::Simple();
     primary_button.transform = [](const ftxui::EntryState& state) {
@@ -111,6 +121,7 @@ ChatUI::ChatUI(ftxui::Closure request_refresh, std::string trusted_ca_override)
     login_container_ = ftxui::Container::Vertical({
         login_username_input_,
         login_password_input_,
+        remember_password_checkbox_,
         login_btn_,
         switch_btn_,
         login_settings_btn_,
@@ -229,6 +240,8 @@ ChatUI::ChatUI(ftxui::Closure request_refresh, std::string trusted_ca_override)
 }
 
 ChatUI::~ChatUI() {
+    render_timer_.request_stop();
+    render_timer_.join();
     connection_.Stop();
 }
 

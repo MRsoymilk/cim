@@ -1,6 +1,8 @@
 #include "ui/chat/ChatUI.hpp"
 #include "ftxui/component/event.hpp"
 #include "ftxui/dom/elements.hpp"
+#include "ftxui/screen/string.hpp"
+#include <chrono>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -8,6 +10,8 @@
 namespace cim {
 
 namespace {
+
+constexpr int kAuthStatusWidth = 46;
 
 std::string FormatTimestamp(int64_t timestamp) {
     if (timestamp <= 0) {
@@ -30,11 +34,33 @@ std::string FormatTimestamp(int64_t timestamp) {
     return output.str();
 }
 
+ftxui::Element ScrollingStatus(std::string message, ftxui::Color color) {
+    const int content_width = ftxui::string_width(message);
+    auto content = ftxui::text(std::move(message)) | ftxui::bold | ftxui::color(color);
+    if (content_width <= kAuthStatusWidth) {
+        return content |
+            ftxui::center |
+            ftxui::size(ftxui::WIDTH, ftxui::EQUAL, kAuthStatusWidth);
+    }
+
+    const auto elapsed = std::chrono::steady_clock::now().time_since_epoch();
+    const auto steps = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() / 150;
+    const int distance = content_width - kAuthStatusWidth;
+    const int phase = static_cast<int>(steps % (distance * 2));
+    const int offset = phase <= distance ? phase : distance * 2 - phase;
+    const float position = static_cast<float>(offset) / static_cast<float>(distance);
+    return content |
+        ftxui::focusPositionRelative(position, 0.0f) |
+        ftxui::frame |
+        ftxui::size(ftxui::WIDTH, ftxui::EQUAL, kAuthStatusWidth);
+}
+
 } // namespace
 
 ftxui::Component ChatUI::GetComponent() {
     return ftxui::Renderer(root_container_, [this] {
         using namespace ftxui;
+        animate_auth_status_.store(false);
 
         if (active_tab_index_ == 2) {
             auto host_field = vbox(Elements{
@@ -118,12 +144,17 @@ ftxui::Component ChatUI::GetComponent() {
                     login_password_input_->Render() | flex,
                 }) | borderLight,
             });
-            Element status = text(" ");
+            Element status = text(" ") | size(WIDTH, EQUAL, kAuthStatusWidth);
+            bool animate_status = false;
             if (!auth_error_.empty()) {
-                status = text("! " + auth_error_) | bold | color(Color::RedLight);
+                const std::string message = "! " + auth_error_;
+                animate_status = string_width(message) > kAuthStatusWidth;
+                status = ScrollingStatus(message, Color::RedLight);
             } else if (!auth_notice_.empty()) {
-                status = text(auth_notice_) | bold | color(Color::GreenLight);
+                animate_status = string_width(auth_notice_) > kAuthStatusWidth;
+                status = ScrollingStatus(auth_notice_, Color::GreenLight);
             }
+            animate_auth_status_.store(animate_status);
 
             auto card = vbox(Elements{
                 text("cim") | bold | color(Color::Cyan) | center,
@@ -138,7 +169,8 @@ ftxui::Component ChatUI::GetComponent() {
                 username_field,
                 text(" "),
                 password_field,
-                status | center,
+                remember_password_checkbox_->Render() | center,
+                status,
                 login_btn_->Render() | size(WIDTH, EQUAL, 44) | hcenter,
                 text(" "),
                 switch_btn_->Render() | center,

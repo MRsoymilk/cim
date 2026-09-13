@@ -111,7 +111,8 @@ void ChatUI::SaveSettings() {
     if (updated.host == client_config_.host && updated.port == client_config_.port &&
         same_ca) {
         updated.username = client_config_.username;
-        updated.session_token = client_config_.session_token;
+        updated.password = client_config_.password;
+        updated.remember_password = client_config_.remember_password;
     }
     if (!updated.Save(settings_error_)) {
         return;
@@ -123,14 +124,15 @@ void ChatUI::SaveSettings() {
 void ChatUI::ReconnectWebSocket() {
     connection_.Stop();
 
-    auth_token_ = client_config_.session_token;
+    auth_token_.clear();
     pending_registration_username_.clear();
     pending_registration_watch_token_.clear();
     registration_request_username_.clear();
     registration_request_watch_token_.clear();
     registration_request_in_flight_ = false;
     auth_username_ = client_config_.username;
-    auth_password_.clear();
+    remember_password_ = client_config_.remember_password;
+    auth_password_ = remember_password_ ? client_config_.password : "";
     my_user_id_ = -1;
     my_name_.clear();
     contacts_.clear();
@@ -139,7 +141,7 @@ void ChatUI::ReconnectWebSocket() {
     selected_contact_index_ = 0;
     notification_.clear();
     auth_error_.clear();
-    auth_notice_ = auth_token_.empty() ? "" : "Restoring saved session...";
+    auth_notice_.clear();
     auth_state_ = AuthState::Login;
     auth_action_label_ = "SIGN IN";
     auth_switch_label_ = "New here? Create an account";

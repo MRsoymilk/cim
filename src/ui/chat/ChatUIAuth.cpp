@@ -110,17 +110,19 @@ void ChatUI::ResetAuthentication(const std::string& message, bool is_error) {
     search_query_.clear();
     chat_input_text_.clear();
     notification_.clear();
-    auth_password_.clear();
+    auth_password_ = client_config_.remember_password
+        ? client_config_.password
+        : "";
+    remember_password_ = client_config_.remember_password;
     auth_state_ = AuthState::Login;
     auth_action_label_ = "SIGN IN";
     auth_switch_label_ = "New here? Create an account";
     active_tab_index_ = 0;
 
     client_config_.username = auth_username_;
-    client_config_.session_token.clear();
     std::string config_error;
     if (!client_config_.Save(config_error)) {
-        auth_error_ = "Unable to clear the saved session: " + config_error;
+        auth_error_ = "Unable to save login settings: " + config_error;
         auth_notice_.clear();
     } else if (is_error) {
         auth_error_ = message;

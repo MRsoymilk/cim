@@ -199,18 +199,19 @@ void ChatUI::DrainSocketEvents() {
             my_user_id_ = payload.value("user_id", int64_t{-1});
             my_name_ = payload.value("username", auth_username_);
             auth_username_ = my_name_;
+            client_config_.username = my_name_;
+            client_config_.remember_password = remember_password_;
+            client_config_.password = remember_password_ ? auth_password_ : "";
             auth_password_.clear();
             auth_state_ = AuthState::LoggedIn;
             connection_.SetAuthenticated(true);
             active_tab_index_ = 1;
             auth_error_.clear();
             auth_notice_.clear();
-            client_config_.username = my_name_;
-            client_config_.session_token = auth_token_;
             std::string config_error;
             notification_ = client_config_.Save(config_error)
                 ? ""
-                : "Logged in, but the session could not be saved: " + config_error;
+                : "Logged in, but the login settings could not be saved: " + config_error;
             connection_.Send(nlohmann::json{{"type", "users"}}.dump());
             split_container_->TakeFocus();
             continue;

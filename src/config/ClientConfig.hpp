@@ -12,7 +12,8 @@ struct ClientConfig {
     std::string ca_source = "BUNDLED";
     std::string custom_ca_path;
     std::string username;
-    std::string session_token;
+    std::string password;
+    bool remember_password = false;
 
     static ClientConfig Load();
     static std::string LoadCaCertificate(const std::filesystem::path& path);

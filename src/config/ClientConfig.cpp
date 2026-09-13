@@ -113,7 +113,10 @@ ClientConfig ClientConfig::Load() {
                 }
             }
             config.username = document.value("username", "");
-            config.session_token = document.value("session_token", "");
+            config.remember_password = document.value("remember_password", false);
+            if (config.remember_password) {
+                config.password = document.value("password", "");
+            }
         }
     } catch (const nlohmann::json::exception&) {
         return ClientConfig{};
@@ -153,7 +156,8 @@ bool ClientConfig::Save(std::string& error) const {
             {"ca_source", ca_source},
             {"custom_ca_path", custom_ca_path},
             {"username", username},
-            {"session_token", session_token},
+            {"password", remember_password ? password : ""},
+            {"remember_password", remember_password},
         }.dump(2) << '\n';
         if (!output) {
             error = "Unable to write the configuration file";

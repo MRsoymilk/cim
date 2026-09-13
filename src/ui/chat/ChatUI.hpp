@@ -5,6 +5,8 @@
 #include "ui/chat/ChatTypes.hpp"
 #include "ftxui/component/component.hpp"
 #include "ftxui/component/task.hpp"
+#include <atomic>
+#include <thread>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -20,9 +22,12 @@ public:
 
 private:
     ClientConnection connection_;
+    std::atomic_bool animate_auth_status_ = false;
+    std::jthread render_timer_;
     AuthState auth_state_ = AuthState::Login;
     std::string auth_username_ = "";
     std::string auth_password_ = "";
+    bool remember_password_ = false;
     std::string auth_error_ = "";
     std::string auth_notice_ = "";
     std::string auth_token_ = "";
@@ -61,6 +66,7 @@ private:
 
     ftxui::Component login_username_input_;
     ftxui::Component login_password_input_;
+    ftxui::Component remember_password_checkbox_;
     ftxui::Component login_btn_;
     ftxui::Component switch_btn_;
     ftxui::Component login_settings_btn_;
