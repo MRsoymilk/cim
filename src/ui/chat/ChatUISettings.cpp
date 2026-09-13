@@ -151,7 +151,10 @@ void ChatUI::ReconnectWebSocket() {
 
 void ChatUI::ConnectWebSocket() {
     connection_.Start(
-        client_config_.WebSocketUrl(), client_config_.TrustedCaData());
+        client_config_.WebSocketUrl(),
+        trusted_ca_override_.empty()
+            ? client_config_.TrustedCaData()
+            : trusted_ca_override_);
 }
 
 } // namespace cim

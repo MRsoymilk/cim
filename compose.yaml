@@ -3,6 +3,7 @@ services:
     build:
       context: .
       target: runtime
+      network: "${CIM_BUILD_NETWORK:-default}"
     image: cim-server:local
     init: true
     user: "${CIM_UID:-1000}:${CIM_GID:-1000}"
@@ -18,11 +19,11 @@ services:
         source: ${CIM_DATA_DIR:-./docker-data}
         target: /data
       - type: bind
-        source: ${CIM_TLS_DIR:?Set CIM_TLS_DIR to the server certificate directory}/server-chain.crt
+        source: ${CIM_TLS_DIR:-./tls}/server-chain.crt
         target: /certs/server-chain.crt
         read_only: true
       - type: bind
-        source: ${CIM_TLS_DIR:?Set CIM_TLS_DIR to the server certificate directory}/server.key
+        source: ${CIM_TLS_DIR:-./tls}/server.key
         target: /certs/server.key
         read_only: true
     read_only: true
@@ -34,3 +35,8 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
     stop_grace_period: 15s
+
+networks:
+  default:
+    external: true
+    name: dev-net

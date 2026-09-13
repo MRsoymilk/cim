@@ -138,7 +138,7 @@ server-chain.crt    服务端使用的完整证书链
 
 续期后需要重启 `cim-server` 才会加载新证书。新增域名或 IP 时，必须在续期命令中再次列出全部仍需保留的 SAN。
 
-构建会把 CA 公共证书复制到 `cim` 可执行文件旁并命名为 `cim-ca.crt`。发布客户端时必须同时分发这两个文件。客户端 Settings 中可改用系统 CA 或指定其他 CA PEM，但不能关闭证书与主机名校验。
+构建会把 CA 公共证书复制到 `cim` 可执行文件旁并命名为 `cim-ca.crt`。发布客户端时必须同时分发这两个文件。客户端 Settings 中可改用系统 CA 或指定其他 CA PEM，也可通过 `cim --ca-cert /path/to/ca.crt` 仅覆盖本次运行使用的 CA；这些方式都不会关闭证书与主机名校验。
 
 从保存 `cim.db` 的工作目录启动服务端：
 
@@ -154,27 +154,36 @@ server-chain.crt    服务端使用的完整证书链
 
 `Dockerfile` 使用多阶段构建，并通过 `CIM_BUILD_CLIENT=OFF` 只构建服务端。运行阶段使用非 root 用户和只读根文件系统；镜像不包含证书、私钥、数据库或管理密钥。
 
-准备持久化目录并设置当前宿主用户身份：
+安装 Docker Engine、Docker Compose、Git 和 OpenSSL 后，以有 Docker 访问权限的普通用户在仓库中运行，无需预先创建网络、目录或证书：
 
 ```bash
-mkdir -p docker-data
-chmod 700 docker-data
-export CIM_UID="$(id -u)"
-export CIM_GID="$(id -g)"
-export CIM_DATA_DIR="$PWD/docker-data"
-export CIM_TLS_DIR="$HOME/.local/share/cim/tls"
-chmod 600 "$CIM_TLS_DIR/server.key"
+bash scripts/docker-up.sh
 ```
 
-`CIM_TLS_DIR` 必须包含 `server-chain.crt` 和 `server.key`。Compose 只挂载这两个文件，不会把 `ca.key` 放入容器。证书和数据目录必须能被 `CIM_UID:CIM_GID` 读取或写入。
+脚本自动初始化 Git 子模块，以当前用户的 UID/GID 运行容器，创建仓库下的 `docker-data/` 和 `tls/`，首次生成本地 CA 及服务端证书，然后构建镜像并后台启动。已有数据和证书会复用，不会自动覆盖或续期；不要使用 `sudo` 运行此脚本。
 
-构建并启动：
+默认服务地址为 `wss://localhost:9001`，证书覆盖 `localhost`、`127.0.0.1` 和 `::1`。可直接指定启动脚本生成的 CA 运行客户端：
 
 ```bash
-docker compose up -d --build
+./build/cim --ca-cert ./tls/ca.crt
+```
+
+也可在客户端 Settings 中选择自定义 CA 并指向 `tls/ca.crt`，或在构建客户端时通过 `CIM_CA_CERT` 指定它。不要分发 `ca.key` 或 `server.key`。
+
+远程部署时，应按前文证书生成说明为实际域名/IP 准备证书，并通过 `CIM_TLS_DIR` 指向其目录；本地默认证书不适用于任意远程地址。可通过 `CIM_DATA_DIR`、`CIM_UID`、`CIM_GID` 覆盖数据目录及容器身份，目录权限须与指定身份匹配。Compose 只挂载 `server-chain.crt` 和 `server.key`，不会把 CA 私钥放入容器。
+
+查看状态及日志：
+
+```bash
 docker compose ps
 docker compose logs -f cim-server
 ```
+
+启动脚本会先校验 Compose 配置，再复用外部 bridge 网络 `dev-net`；新机器上不存在该网络时自动创建，Linux 桥接口命名为 `br-docker`，子网由 Docker 分配。已有网络若不是 bridge 驱动则报错停止，不会删除或重建；已有 bridge 网络即使接口名不同也会保留。脚本可从任意目录调用，项目目录固定为本仓库。
+
+本配置面向可信的开发环境：加入 `dev-net` 的其他项目容器可以直接访问 `cim-server:9001`，不受宿主发布端口的限制；管理端口仍仅监听容器内的 `127.0.0.1:9002`。需要跨项目隔离的生产环境不应直接使用此共享网络配置。同一共享网络上的多个 CIM 实例需要避免服务 DNS 名称冲突。`docker compose down` 不会删除外部共享网络，启动脚本也不会清理其他网络。
+
+脚本接受额外的 `docker compose up` 参数，例如 `bash scripts/docker-up.sh --wait`。`CIM_BUILD_NETWORK` 可选设置构建网络，默认为 `default`，不影响容器运行时的共享 bridge 网络。
 
 主机端口默认为 `9001`，可以在启动前通过 `CIM_PORT` 修改。管理端口 `9002` 不会映射到宿主机，管理命令应在容器内部执行：
 

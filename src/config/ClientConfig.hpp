@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 
 namespace cim {
@@ -14,6 +15,7 @@ struct ClientConfig {
     std::string session_token;
 
     static ClientConfig Load();
+    static std::string LoadCaCertificate(const std::filesystem::path& path);
     bool Save(std::string& error) const;
     std::string WebSocketUrl() const;
     std::string TrustedCaData() const;

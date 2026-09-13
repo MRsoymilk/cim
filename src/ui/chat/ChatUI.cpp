@@ -6,8 +6,9 @@
 
 namespace cim {
 
-ChatUI::ChatUI(ftxui::Closure request_refresh)
-    : connection_(std::move(request_refresh)) {
+ChatUI::ChatUI(ftxui::Closure request_refresh, std::string trusted_ca_override)
+    : connection_(std::move(request_refresh)),
+      trusted_ca_override_(std::move(trusted_ca_override)) {
     client_config_ = ClientConfig::Load();
     auth_username_ = client_config_.username;
     auth_token_ = client_config_.session_token;

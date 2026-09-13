@@ -121,6 +121,10 @@ ClientConfig ClientConfig::Load() {
     return config;
 }
 
+std::string ClientConfig::LoadCaCertificate(const std::filesystem::path& path) {
+    return ReadCertificate(path);
+}
+
 bool ClientConfig::Save(std::string& error) const {
     try {
         const auto path = ConfigPath();
@@ -184,9 +188,9 @@ std::string ClientConfig::TrustedCaData() const {
     }
     if (ca_source == "CUSTOM" && !custom_ca_path.empty() &&
         custom_ca_path != "NONE" && custom_ca_path != "SYSTEM") {
-        return ReadCertificate(Utf8Path(custom_ca_path));
+        return LoadCaCertificate(Utf8Path(custom_ca_path));
     }
-    return ReadCertificate(ExecutableDirectory() / "cim-ca.crt");
+    return LoadCaCertificate(ExecutableDirectory() / "cim-ca.crt");
 }
 
 } // namespace cim

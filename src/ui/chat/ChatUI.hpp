@@ -13,7 +13,8 @@ namespace cim {
 
 class ChatUI {
 public:
-    explicit ChatUI(ftxui::Closure request_refresh);
+    explicit ChatUI(
+        ftxui::Closure request_refresh, std::string trusted_ca_override = {});
     ~ChatUI();
     ftxui::Component GetComponent();
 
@@ -46,6 +47,7 @@ private:
     std::string notification_;
 
     ClientConfig client_config_;
+    std::string trusted_ca_override_;
     std::string settings_host_;
     std::string settings_port_;
     std::vector<std::string> settings_ca_sources_{"BUNDLED", "SYSTEM", "CUSTOM"};
